@@ -104,7 +104,7 @@ local function generate_weighted_trade_query(params)
   options.statWeights = options.statWeights or build.itemsTab.tradeQuery.statSortSelectionList
   if not options.statWeights or #options.statWeights == 0 then options.statWeights = { { label = 'Full DPS', stat = 'FullDPS', weightMult = 1.0 }, { label = 'Effective Hit Pool', stat = 'TotalEHP', weightMult = 0.5 } } end
   local ok, result = pcall(function()
-    local generator = new('TradeQueryGenerator', build.itemsTab.tradeQuery)
+    local generator = new('TradeQueryGenerator'):TradeQueryGenerator(build.itemsTab.tradeQuery)
     local query, warning
     generator.requesterCallback = function(_, generated, err) query, warning = generated, err end
     generator.requesterContext = {}
