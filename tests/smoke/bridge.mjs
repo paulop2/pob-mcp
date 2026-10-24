@@ -7,9 +7,14 @@ import { PoBLuaApiClient } from '../../build/pobLuaBridge.js';
 const cwd = process.env.POB_PATH || process.env.POB_FORK_PATH;
 if (!cwd) throw new Error('POB_PATH must point to a stock PoB src directory.');
 
+const cmd = process.env.POB_CMD || 'luajit';
+const args = process.env.POB_ARGS
+  ? process.env.POB_ARGS.split(/\s+/).filter(Boolean)
+  : [resolve('lua/vanilla_stdio_bridge.lua')];
 const client = new PoBLuaApiClient({
   cwd,
-  args: [resolve('lua/vanilla_stdio_bridge.lua')],
+  cmd,
+  args,
   env: { POB_API_STDIO: '0' },
   timeoutMs: 60_000,
 });
