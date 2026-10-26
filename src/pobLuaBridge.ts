@@ -326,6 +326,19 @@ export class PoBLuaApiClient {
     return res.stats as Record<string, any>;
   }
 
+  /** The whole calculated output, flattened to dotted keys at full precision. */
+  async getOutput(): Promise<Record<string, number | boolean | string>> {
+    const res = await this.send({ action: "get_output" });
+    if (!res.ok) throw new Error(res.error || "get_output failed");
+    return res.output as Record<string, number | boolean | string>;
+  }
+
+  async getDiagnostics(): Promise<{ inflate: string; devAutoSave: boolean; lastLoadError?: string }> {
+    const res = await this.send({ action: "diagnostics" });
+    if (!res.ok) throw new Error(res.error || "diagnostics failed");
+    return res.diagnostics as { inflate: string; devAutoSave: boolean; lastLoadError?: string };
+  }
+
   async getTree(): Promise<any> {
     const res = await this.send({ action: "get_tree" });
     if (!res.ok) throw new Error(res.error || "get_tree failed");

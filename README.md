@@ -208,6 +208,17 @@ npm run test:smoke:crafting
 
 This verifies that the crafting advisor obtains current currency rates and base-mod data for a known item base through MCP.
 
+To score the bridge against a differential oracle (for example [pob-oracle](https://github.com/paulop2/pob-oracle)'s golden outputs), `tools/oracle_impl.mjs` implements the `CMD <in.jsonl> <out.jsonl>` contract: each `{"id", "xml"}` request is loaded through the bridge and answered with the whole calculated output, flattened to dotted keys at full precision (`get_output`). It starts the bridge from `POB_PATH`, `POB_CMD` and `POB_ARGS`, the same way the server does.
+
+#### Headless fixes the adapter applies
+
+Stock `HeadlessWrapper.lua` is meant for PoB's own unit tests, so the adapter works around a few things that would otherwise give wrong numbers silently:
+
+- **Timeless jewels:** headless stubs `Inflate()` to return `""`, so Glorious Vanity, Lethal Pride and the other timeless jewels calculate without their lookup tables. The adapter installs a real inflate through LuaJIT FFI and PoB's bundled `zlib1.dll` (or the system zlib). `diagnostics` reports `inflate: "zlib"` when it is active.
+- **State between builds:** each load passes through an empty build first, discards the outgoing build's cluster jewel graphs, and restores the gem cost tables that PoB clears in shared skill data for triggered skills (otherwise one build zeroes a skill's mana cost for every build loaded after it).
+- **Failed loads:** a load that fails, raises a prompt or opens a popup is an error, and every build-reading action refuses until the next successful load instead of answering with the previous build.
+- **Dev-mode autosave** to `~~temp~~.xml` on every build switch is disabled.
+
 #### 3. Verify
 ```bash
 luajit -v
