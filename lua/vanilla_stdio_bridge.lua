@@ -13,14 +13,169 @@ if not GetVirtualScreenSize then
   function GetVirtualScreenSize() return 1920, 1080 end
 end
 
+-- The timeless jewel loader caches inflated LUTs to Data/TimelessJewelData/*.bin
+-- with "wb+". Headless never reads them back (NewFileSearch is stubbed), and two
+-- bridge processes would race on those files, so load with caching disabled.
+do
+  local okLoader, loadJewelFile = pcall(dofile, 'Modules/DataJewelFileLoader.lua')
+  if okLoader and type(loadJewelFile) == 'function' then
+    package.loaded['Modules.DataJewelFileLoader'] = function(name) return loadJewelFile(name, false) end
+  end
+end
+
 -- The upstream wrapper initializes PoB and exposes newBuild/loadBuildFromXML plus `build`.
 dofile('HeadlessWrapper.lua')
 
+-- HeadlessWrapper stubs Inflate() to return "", so every timeless jewel
+-- (Glorious Vanity, Lethal Pride, ...) is calculated as if its lookup table were
+-- missing. Replace it with real zlib inflate through LuaJIT FFI, using the
+-- zlib PoB ships next to its runtime (or the system zlib elsewhere).
+local INFLATE_STATUS = 'stub'
+do
+  local okFfi, ffi = pcall(require, 'ffi')
+  if okFfi then
+    pcall(ffi.cdef, [[
+      typedef struct {
+        const unsigned char *next_in; unsigned avail_in; unsigned long total_in;
+        unsigned char *next_out; unsigned avail_out; unsigned long total_out;
+        const char *msg; void *state; void *zalloc; void *zfree; void *opaque;
+        int data_type; unsigned long adler; unsigned long reserved;
+      } pobmcp_z_stream;
+      const char *zlibVersion(void);
+      int inflateInit_(pobmcp_z_stream *strm, const char *version, int stream_size);
+      int inflate(pobmcp_z_stream *strm, int flush);
+      int inflateEnd(pobmcp_z_stream *strm);
+    ]])
+    local zlib
+    for _, name in ipairs({ '../runtime/zlib1.dll', 'zlib1', 'z' }) do
+      local okLoad, lib = pcall(ffi.load, name)
+      if okLoad then zlib = lib; break end
+    end
+    if zlib then
+      local Z_OK, Z_STREAM_END, CHUNK = 0, 1, 4 * 1024 * 1024
+      function Inflate(data)
+        local strm = ffi.new('pobmcp_z_stream')
+        if zlib.inflateInit_(strm, zlib.zlibVersion(), ffi.sizeof(strm)) ~= Z_OK then
+          return nil, 'inflateInit failed'
+        end
+        local input = ffi.new('unsigned char[?]', #data)
+        ffi.copy(input, data, #data)
+        strm.next_in, strm.avail_in = input, #data
+        local buf, parts = ffi.new('unsigned char[?]', CHUNK), {}
+        local ret
+        repeat
+          strm.next_out, strm.avail_out = buf, CHUNK
+          ret = zlib.inflate(strm, 0)
+          if ret ~= Z_OK and ret ~= Z_STREAM_END then
+            zlib.inflateEnd(strm)
+            return nil, 'inflate failed: ' .. ret
+          end
+          parts[#parts + 1] = ffi.string(buf, CHUNK - strm.avail_out)
+        until ret == Z_STREAM_END
+        zlib.inflateEnd(strm)
+        return table.concat(parts)
+      end
+      INFLATE_STATUS = 'zlib'
+    end
+  end
+  if INFLATE_STATUS == 'stub' then
+    io.stderr:write('pob-mcp: no zlib available; timeless jewels will calculate without their lookup tables\n')
+  end
+end
+
+-- Headless runs in dev mode, which autosaves the outgoing build to
+-- buildPath/~~temp~~.xml on every switch and opens an error popup when that fails.
+if __mainObject__ and __mainObject__.main then
+  __mainObject__.main.disableDevAutoSave = true
+end
+
+-- SkillsTab:ProcessSocketGroup clears `grantedEffect.levels[level].cost` for
+-- triggered skills by writing into the shared data.skills tables, so one build
+-- zeroes the mana cost of that skill level for every build loaded after it in
+-- this process. Remember the original cost tables and put them back before
+-- each load.
+local skillCostSnapshot = {}
+if data and data.skills then
+  for _, grantedEffect in pairs(data.skills) do
+    if type(grantedEffect) == 'table' and type(grantedEffect.levels) == 'table' then
+      for _, levelData in pairs(grantedEffect.levels) do
+        if type(levelData) == 'table' then skillCostSnapshot[levelData] = levelData.cost or false end
+      end
+    end
+  end
+end
+local function restoreSkillCosts()
+  for levelData, cost in pairs(skillCostSnapshot) do
+    levelData.cost = cost or nil
+  end
+end
+
 local BuildOps = dofile(ADAPTER_DIR .. 'pob_ops.lua')
 
+-- Set when the last load_build_xml failed: the bridge then refuses to report
+-- stats instead of answering with whatever build happens to be in memory.
+local lastLoadError = nil
+
+local function closePopups()
+  local main = __mainObject__ and __mainObject__.main
+  local titles = {}
+  if main and main.popups then
+    for i, popup in ipairs(main.popups) do titles[i] = tostring(popup.title) end
+    while #main.popups > 0 do main:ClosePopup() end
+  end
+  return titles
+end
+
+-- Load a build without inheriting anything from the outgoing one, and fail
+-- loudly instead of leaving the previous build's output in place.
+local function loadFresh(xml, name)
+  __mainObject__.promptMsg = nil
+  closePopups()
+  -- PoB reuses the build object across loads. Cluster jewel subGraphs from the
+  -- outgoing build point at sockets the next load has already replaced, and
+  -- PostLoad asserts while trying to remove them.
+  if build and build.spec then build.spec.subGraphs = {} end
+  -- Loading straight over another build can read the outgoing build's tabs
+  -- (e.g. a stale activeSpec index); passing through an empty build resets them.
+  _G.newBuild()
+  restoreSkillCosts()
+  local stale = build and build.calcsTab and build.calcsTab.mainOutput
+  _G.loadBuildFromXML(xml, name)
+  local prompt = __mainObject__.promptMsg
+  __mainObject__.promptMsg = nil
+  if prompt then error('PoB prompt: ' .. tostring(prompt), 0) end
+  local popups = closePopups()
+  if #popups > 0 then error('PoB opened a popup: ' .. table.concat(popups, ' | '), 0) end
+  local output = build and build.calcsTab and build.calcsTab.mainOutput
+  if not output or output == stale then error('build did not produce a fresh calculation', 0) end
+end
+
 local function reply(value)
-  io.write(json.encode(value), '\n')
+  -- An unencodable reply (e.g. a reference cycle) must not kill the bridge.
+  local ok, encoded = pcall(json.encode, value)
+  if not ok then encoded = json.encode({ ok = false, error = 'cannot encode reply: ' .. tostring(encoded) }) end
+  io.write(encoded, '\n')
   io.flush()
+end
+
+-- Copy only plain data out of a PoB output table: no class instances (tables
+-- with a metatable), no cycles, bounded depth. PoB's output references items,
+-- gems and mod lists that dkjson cannot encode.
+local function plainCopy(t, onPath, depth)
+  onPath[t] = true
+  local copy = {}
+  for k, v in pairs(t) do
+    local tk, tv = type(k), type(v)
+    if tk == 'string' or tk == 'number' then
+      if tv == 'number' or tv == 'boolean' or tv == 'string' then
+        copy[k] = v
+      elseif tv == 'table' and not onPath[v] and depth < 6 and getmetatable(v) == nil then
+        copy[k] = plainCopy(v, onPath, depth + 1)
+      end
+    end
+  end
+  onPath[t] = nil
+  return copy
 end
 
 -- Class name → classId mapping (PoE1)
@@ -147,7 +302,10 @@ end
 
 handlers.new_build = function(params)
   if not _G.newBuild then return { ok = false, error = 'headless wrapper not initialized' } end
+  if build and build.spec then build.spec.subGraphs = {} end
   _G.newBuild()
+  restoreSkillCosts()
+  lastLoadError = nil
   if params and (params.className or params.ascendancy) then
     local classId = params.className and (CLASS_IDS[params.className] or CLASS_IDS[params.className:lower()]) or 0
     local ascendId = params.ascendancy and ASCENDANCY_IDS[classId] and ASCENDANCY_IDS[classId][params.ascendancy] or 0
@@ -161,9 +319,74 @@ end
 handlers.load_build_xml = function(params)
   if not params or type(params.xml) ~= 'string' then return { ok = false, error = 'missing xml' } end
   if not _G.loadBuildFromXML then return { ok = false, error = 'headless wrapper not initialized' } end
-  local ok, err = pcall(_G.loadBuildFromXML, params.xml, (params.name and tostring(params.name)) or 'API Build')
-  if not ok then return { ok = false, error = tostring(err) } end
+  local ok, err = pcall(loadFresh, params.xml, (params.name and tostring(params.name)) or 'API Build')
+  if not ok then
+    lastLoadError = tostring(err)
+    return { ok = false, error = lastLoadError }
+  end
+  lastLoadError = nil
   return { ok = true, build_id = 1 }
+end
+
+-- Flatten nested output tables into dotted keys. Only plain data is followed:
+-- tables with a metatable are class instances (items, mod lists) that output
+-- merely references, and table keys would stringify to memory addresses.
+-- Same contract as pob-oracle's reference evaluator, so its `check` can score
+-- this bridge directly.
+local FLAT_MAX_DEPTH = 6
+local function flatten(t, prefix, out, onPath, depth)
+  onPath[t] = true
+  for k, v in pairs(t) do
+    local tk = type(k)
+    if tk == 'string' or tk == 'number' then
+      local key = prefix .. tostring(k)
+      local tv = type(v)
+      if tv == 'number' or tv == 'boolean' or tv == 'string' then
+        out[key] = v
+      elseif tv == 'table' and not onPath[v] and depth < FLAT_MAX_DEPTH and getmetatable(v) == nil then
+        flatten(v, key .. '.', out, onPath, depth + 1)
+      end
+    end
+  end
+  onPath[t] = nil
+  return out
+end
+
+-- dkjson prints numbers with %.14g; full precision needs %.17g.
+local function encodeFlatValue(v)
+  local tv = type(v)
+  if tv == 'number' then
+    if v ~= v then return '"NaN"' end
+    if v == math.huge then return '"Infinity"' end
+    if v == -math.huge then return '"-Infinity"' end
+    return ('%.17g'):format(v)
+  end
+  if tv == 'boolean' then return v and 'true' or 'false' end
+  return json.quotestring(tostring(v))
+end
+
+local function encodeFlat(map)
+  local keys = {}
+  for k in pairs(map) do keys[#keys + 1] = k end
+  table.sort(keys)
+  local parts = {}
+  for i, k in ipairs(keys) do parts[i] = json.quotestring(k) .. ':' .. encodeFlatValue(map[k]) end
+  return '{' .. table.concat(parts, ',') .. '}'
+end
+
+-- The whole calculated output, flattened, as pre-encoded JSON (see reply loop).
+handlers.get_output = function()
+  local output = build and build.calcsTab and build.calcsTab.mainOutput
+  if not output then return { ok = false, error = 'no build loaded' } end
+  return { __raw = '{"ok":true,"output":' .. encodeFlat(flatten(output, '', {}, {}, 0)) .. '}' }
+end
+
+handlers.diagnostics = function()
+  return { ok = true, diagnostics = {
+    inflate = INFLATE_STATUS,
+    devAutoSave = not (__mainObject__ and __mainObject__.main and __mainObject__.main.disableDevAutoSave),
+    lastLoadError = lastLoadError,
+  } }
 end
 
 handlers.get_stats = function(params)
@@ -215,7 +438,11 @@ handlers.get_items = op(BuildOps.get_items, 'items')
 handlers.get_skills = op(BuildOps.get_skills, 'skills')
 handlers.get_build_info = op(BuildOps.get_build_info, 'info')
 handlers.get_config = op(BuildOps.get_config, 'config')
-handlers.calc_with = op(BuildOps.calc_with, 'output')
+handlers.calc_with = function(params)
+  local out, err = BuildOps.calc_with(params or {})
+  if out == nil then return { ok = false, error = err or 'operation failed' } end
+  return { ok = true, output = plainCopy(out, {}, 0) }
+end
 handlers.export_build_xml = op(BuildOps.export_build_xml, 'xml')
 handlers.add_item_text = op(BuildOps.add_item_text, 'item')
 handlers.create_socket_group = op(BuildOps.create_socket_group, 'socketGroup')
@@ -242,6 +469,13 @@ handlers.get_capabilities = function()
   return { ok = true, capabilities = { mode = 'vanilla', adapter = 'vanilla-stdio-v2', actions = actions } }
 end
 
+-- Actions that still answer after a failed load; everything else would read
+-- whatever build happens to be in memory, so it refuses until the next load.
+local LOAD_INDEPENDENT = {
+  ping = true, version = true, get_capabilities = true, diagnostics = true,
+  new_build = true, load_build_xml = true,
+}
+
 reply({ ok = true, ready = true, version = { adapter = 'vanilla-stdio-v2' } })
 for line in io.lines() do
   local request = json.decode(line)
@@ -253,12 +487,17 @@ for line in io.lines() do
   local handler = handlers[action]
   if not handler then
     reply({ ok = false, error = 'unknown action: ' .. tostring(action) })
+  elseif lastLoadError and not LOAD_INDEPENDENT[action] then
+    reply({ ok = false, error = 'last build load failed: ' .. lastLoadError })
   else
     local ok, res = pcall(handler, params)
     if not ok then
       reply({ ok = false, error = tostring(res) })
     elseif type(res) ~= 'table' then
       reply({ ok = false, error = 'handler returned no response' })
+    elseif res.__raw then
+      io.write(res.__raw, '\n')
+      io.flush()
     else
       reply(res)
     end

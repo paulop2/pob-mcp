@@ -45,6 +45,24 @@ try {
   if (restored.ascendClassId !== tree.ascendClassId || restored.nodes.join(',') !== tree.nodes.join(',')) {
     throw new Error('tree mutation did not restore the original allocation');
   }
+  // Headless fixes: real inflate (timeless jewels), no dev-mode autosave.
+  const diagnostics = await client.getDiagnostics();
+  if (diagnostics.inflate !== 'zlib' || diagnostics.devAutoSave !== false) {
+    throw new Error(`headless fixes not active: ${JSON.stringify(diagnostics)}`);
+  }
+  // calc_with answers with plain data only (PoB output references items and
+  // mod lists with reference cycles, which used to crash the bridge).
+  const simulated = await client.calcWith({});
+  if (typeof simulated?.Life !== 'number') throw new Error('calc_with returned no Life');
+  const output = await client.getOutput();
+  if (typeof output.Life !== 'number' || Object.keys(output).length < 100) throw new Error('get_output returned too few stats');
+  // A failed load must not leave the previous build's stats readable.
+  let failed = false;
+  try { await client.loadBuildXml('<PathOfBuilding><Build', 'broken-load-smoke'); } catch { failed = true; }
+  if (!failed) throw new Error('loading a broken XML did not fail');
+  let staleRead = true;
+  try { await client.getStats(['Life']); } catch { staleRead = false; }
+  if (staleRead) throw new Error('get_stats answered after a failed load (stale build)');
   await client.loadBuildXml(await readFile(resolve(cwd, '../spec/TestBuilds/3.13/OccVortex.xml'), 'utf8'), 'weighted-query-smoke');
   const weighted = await client.generateWeightedTradeQuery('Amulet');
   const query = weighted.query;
