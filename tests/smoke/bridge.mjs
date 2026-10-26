@@ -56,6 +56,11 @@ try {
   if (typeof simulated?.Life !== 'number') throw new Error('calc_with returned no Life');
   const output = await client.getOutput();
   if (typeof output.Life !== 'number' || Object.keys(output).length < 100) throw new Error('get_output returned too few stats');
+  // A build without targetVersion is converted like the GUI's default button
+  // (the MCP's own startup probe loads exactly such an XML).
+  const minimal = await client.loadBuildXml('<?xml version="1.0" encoding="UTF-8"?><PathOfBuilding><Build level="1" className="Witch"/></PathOfBuilding>', 'convert-smoke');
+  if (minimal.converted !== true) throw new Error(`minimal XML was not converted: ${JSON.stringify(minimal)}`);
+  if (typeof (await client.getStats(['Life'])).Life !== 'number') throw new Error('converted build has no Life');
   // A failed load must not leave the previous build's stats readable.
   let failed = false;
   try { await client.loadBuildXml('<PathOfBuilding><Build', 'broken-load-smoke'); } catch { failed = true; }
