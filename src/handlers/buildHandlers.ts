@@ -5,7 +5,8 @@ import type { TreeAnalysisResult } from "../types.js";
 import type { HandlerContext } from "../utils/contextBuilder.js";
 import fs from "fs/promises";
 import { wrapHandler } from "../utils/errorHandling.js";
-import { sanitizeBuildName } from "../utils/pathSanitizer.js";
+import { resolveBuildFile } from "../utils/pathSanitizer.js";
+import { BOOTSTRAP_BUILD_NAME } from "../server/bootstrapBuild.js";
 export type { HandlerContext } from "../utils/contextBuilder.js";
 
 export async function handleListBuilds(context: HandlerContext) {
@@ -41,7 +42,6 @@ export async function handleAnalyzeBuild(context: HandlerContext, buildName: str
     const luaClient = context.getLuaClient();
 
     if (luaClient) {
-      const basename = (n: string) => n.split(/[/\\]/).pop() ?? n;
       let shouldLoad = true;
       try {
         const info = await luaClient.getBuildInfo();
@@ -49,10 +49,12 @@ export async function handleAnalyzeBuild(context: HandlerContext, buildName: str
         // Strip .xml suffix for comparison since PoB may omit it
         const requested = buildName.replace(/\.xml$/i, '');
         const loaded    = loadedName.replace(/\.xml$/i, '');
-        if (loaded) {
-          const sameExact = loaded === requested;
-          const sameBase  = basename(loaded) === basename(requested);
-          if (!sameExact && !sameBase) {
+        if (loaded && loaded !== BOOTSTRAP_BUILD_NAME) {
+          const sourcePath = luaClient.getLoadedFilePath?.();
+          const sameBuild = sourcePath
+            ? sourcePath === resolveBuildFile(buildName, context.pobDirectory)
+            : loaded === requested;
+          if (!sameBuild) {
             // A different build is in memory — skip loading to avoid destroying unsaved work
             shouldLoad = false;
             luaSkipped = true;
@@ -64,36 +66,38 @@ export async function handleAnalyzeBuild(context: HandlerContext, buildName: str
       } catch { /* no build loaded yet — safe to load */ }
 
       if (shouldLoad) {
-        const buildPath = sanitizeBuildName(buildName, context.pobDirectory);
+        const buildPath = resolveBuildFile(buildName, context.pobDirectory);
         const buildXml = await fs.readFile(buildPath, 'utf-8');
-        await luaClient.loadBuildXml(buildXml);
+        await luaClient.loadBuildXml(buildXml, buildName.replace(/\.xml$/i, ""), buildPath);
       }
-      try { luaStats = await luaClient.getStats(); } catch { /* best effort */ }
+      if (!luaSkipped) {
+        try { luaStats = await luaClient.getStats(); } catch { /* best effort */ }
 
-      // Query active spec/item set for context and to guide tree analysis
-      try {
-        const specsResult = await luaClient.listSpecs();
-        const itemSetsResult = await luaClient.listItemSets();
-        const activeSpec = specsResult?.specs?.find((s: any) => s.active);
-        const activeItemSet = itemSetsResult?.itemSets?.find((s: any) => s.active);
-        if (activeSpec) luaActiveSpecIndex = activeSpec.index;
-        if (activeItemSet) luaActiveItemSetId = String(activeItemSet.id);
-        const numSpecs = specsResult?.specs?.length ?? 0;
-        const numSets = itemSetsResult?.itemSets?.length ?? 0;
-        if (numSpecs > 1 || numSets > 1) {
-          const parts: string[] = [];
-          if (activeSpec && numSpecs > 1) {
-            parts.push(`Spec ${activeSpec.index}/${numSpecs}: "${activeSpec.title}" (${activeSpec.nodeCount} nodes)`);
+        // Query active spec/item set for context and to guide tree analysis
+        try {
+          const specsResult = await luaClient.listSpecs();
+          const itemSetsResult = await luaClient.listItemSets();
+          const activeSpec = specsResult?.specs?.find((s: any) => s.active);
+          const activeItemSet = itemSetsResult?.itemSets?.find((s: any) => s.active);
+          if (activeSpec) luaActiveSpecIndex = activeSpec.index;
+          if (activeItemSet) luaActiveItemSetId = String(activeItemSet.id);
+          const numSpecs = specsResult?.specs?.length ?? 0;
+          const numSets = itemSetsResult?.itemSets?.length ?? 0;
+          if (numSpecs > 1 || numSets > 1) {
+            const parts: string[] = [];
+            if (activeSpec && numSpecs > 1) {
+              parts.push(`Spec ${activeSpec.index}/${numSpecs}: "${activeSpec.title}" (${activeSpec.nodeCount} nodes)`);
+            }
+            if (activeItemSet && numSets > 1) {
+              parts.push(`Item Set ${activeItemSet.id}/${numSets}: "${activeItemSet.title}"`);
+            }
+            if (parts.length > 0) {
+              specContextLines.push(`[Analyzing: ${parts.join(' | ')}]`);
+              specContextLines.push('Use select_spec / select_item_set to switch before re-analyzing.');
+            }
           }
-          if (activeItemSet && numSets > 1) {
-            parts.push(`Item Set ${activeItemSet.id}/${numSets}: "${activeItemSet.title}"`);
-          }
-          if (parts.length > 0) {
-            specContextLines.push(`[Analyzing: ${parts.join(' | ')}]`);
-            specContextLines.push('Use select_spec / select_item_set to switch before re-analyzing.');
-          }
-        }
-      } catch { /* advisory only */ }
+        } catch { /* advisory only */ }
+      }
     }
   } catch (error) {
     // Continue with XML-only analysis
@@ -109,16 +113,13 @@ export async function handleAnalyzeBuild(context: HandlerContext, buildName: str
     ...(luaActiveItemSetId !== null && build.Items
       ? { Items: { ...(build.Items as any), activeItemSet: luaActiveItemSetId } }
       : {}),
-    ...(luaActiveItemSetId !== null && build.Skills
-      ? { Skills: { ...(build.Skills as any), activeSkillSet: luaActiveItemSetId } }
-      : {}),
   };
 
   const summaryParts: string[] = [context.buildService.generateBuildSummary(buildForAnalysis)];
 
   if (luaSkipped) {
     summaryParts.push(
-      "\n⚠️  Note: A different build is loaded in the Lua bridge. Stats shown are from that build.\n" +
+      "\n⚠️  Note: A different build is loaded in the Lua bridge. Live stats and selections were skipped; this analysis uses the requested saved file.\n" +
       "    Use lua_load_build to load this build for accurate live stats."
     );
   }
@@ -236,10 +237,10 @@ export async function handleCompareBuilds(context: HandlerContext, build1Name: s
   // saved state matches what the user sees in PoB and avoids reporting wrong stats
   // (e.g. resistances from a different gear set than the one the user expects).
   const loadEndgame = async (luaClient: any, buildName: string) => {
-    const buildPath = sanitizeBuildName(buildName, context.pobDirectory);
+    const buildPath = resolveBuildFile(buildName, context.pobDirectory);
     const buildXml = await fs.readFile(buildPath, 'utf-8');
     const displayName = buildName.replace(/\.xml$/i, '').split(/[/\\]/).pop() ?? buildName;
-    await luaClient.loadBuildXml(buildXml, displayName);
+    await luaClient.loadBuildXml(buildXml, displayName, buildPath);
 
     let selectedSpec: any = null;
     let selectedItemSet: any = null;
@@ -259,7 +260,13 @@ export async function handleCompareBuilds(context: HandlerContext, build1Name: s
       }
     } catch { /* ignore */ }
 
-    const stats = await luaClient.getStats();
+    // get_stats defaults to defence-only fields, so the offensive rows below have
+    // to be requested by name — otherwise DPS and crit always render as "N/A".
+    const stats = await luaClient.getStats([
+      'Life', 'EnergyShield', 'TotalEHP', 'Mana',
+      'TotalDPS', 'CombinedDPS', 'MinionTotalDPS', 'CritChance', 'CritMultiplier',
+      'FireResist', 'ColdResist', 'LightningResist', 'ChaosResist',
+    ]);
     return { stats, selectedSpec, selectedItemSet, displayName };
   };
 
@@ -282,7 +289,9 @@ export async function handleCompareBuilds(context: HandlerContext, build1Name: s
       const info = await luaClient.getBuildInfo();
       loadedName = info?.name ?? '';
     } catch { /* no build loaded yet — safe to load */ }
-    if (loadedName) {
+    // The bootstrap build is not user work — a freshly started bridge always holds
+    // it, so treating it as unsaved changes would block compare_builds outright.
+    if (loadedName && loadedName !== BOOTSTRAP_BUILD_NAME) {
       const loaded = basename(loadedName);
       if (loaded !== basename(build1Name) && loaded !== basename(build2Name)) {
         throw new Error(
@@ -444,7 +453,7 @@ export async function handleGetBuildNotes(context: HandlerContext, buildName: st
 
 export async function handleSetBuildNotes(context: HandlerContext, buildName: string, notes: string) {
   return wrapHandler('set build notes', async () => {
-    const buildPath = sanitizeBuildName(buildName, context.pobDirectory);
+    const buildPath = resolveBuildFile(buildName, context.pobDirectory);
     let xml = await fs.readFile(buildPath, 'utf-8');
 
     // XML-escape the notes content so special characters don't corrupt the build file

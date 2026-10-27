@@ -324,6 +324,10 @@ local function loadFresh(xml, name)
   if #popups > 0 then error('PoB opened a popup: ' .. table.concat(popups, ' | '), 0) end
   local output = build and build.calcsTab and build.calcsTab.mainOutput
   if not output or output == stale then error('build did not produce a fresh calculation', 0) end
+  -- PoB can close the build without throwing; shutdown clears savers.
+  if not build.savers or not build.spec then
+    error('PoB did not initialize the build; check the XML and supported build version', 0)
+  end
   return converted
 end
 
@@ -603,15 +607,22 @@ handlers.set_tree = function(params)
 end
 
 handlers.update_tree_delta = function(params)
-  local ok2, err = BuildOps.update_tree_delta(params or {})
-  if not ok2 then return { ok = false, error = err } end
-  return { ok = true, tree = (BuildOps.get_tree()) }
+  local result, err = BuildOps.update_tree_delta(params or {})
+  if not result then return { ok = false, error = err } end
+  return { ok = true, tree = result.tree, droppedNodes = result.droppedNodes }
 end
 
 handlers.set_config = function(params)
-  local ok2, err = BuildOps.set_config(params or {})
-  if not ok2 then return { ok = false, error = err } end
-  return { ok = true, config = (BuildOps.get_config()) }
+  local result, err = BuildOps.set_config(params or {})
+  if not result then return { ok = false, error = err } end
+  -- Report per-key outcomes so the caller can tell an applied change from a
+  -- rejected one instead of assuming success.
+  return {
+    ok = true,
+    applied = result.applied,
+    rejected = result.rejected,
+    config = (BuildOps.get_config()),
+  }
 end
 
 handlers.set_main_selection = function(params)
@@ -638,7 +649,11 @@ handlers.get_tree = op(BuildOps.get_tree, 'tree')
 handlers.get_items = op(BuildOps.get_items, 'items')
 handlers.get_skills = op(BuildOps.get_skills, 'skills')
 handlers.get_build_info = op(BuildOps.get_build_info, 'info')
-handlers.get_config = op(BuildOps.get_config, 'config')
+handlers.get_config = function()
+  local cfg, err = BuildOps.get_config()
+  if cfg == nil then return { ok = false, error = err or 'operation failed' } end
+  return { ok = true, config = cfg, labels = (BuildOps.get_config_labels()) }
+end
 -- Output keys only the Full DPS roll-up writes. That roll-up re-runs the whole
 -- calculation once per Full DPS skill, so it is skipped when none is asked for.
 local FULL_DPS_FIELDS = { FullDPS = true, FullDotDPS = true, SkillDPS = true }
@@ -675,6 +690,7 @@ handlers.create_socket_group = op(BuildOps.create_socket_group, 'socketGroup')
 handlers.add_gem = op(BuildOps.add_gem, 'gem')
 handlers.search_nodes = op(BuildOps.search_nodes, 'results')
 handlers.get_mastery_options = op(BuildOps.get_mastery_options, 'result')
+handlers.get_ailments = op(BuildOps.get_ailments, 'result')
 handlers.save_build = op(BuildOps.save_build, 'result')
 handlers.list_specs = op(BuildOps.list_specs, 'result')
 handlers.select_spec = op(BuildOps.select_spec, 'result')
@@ -709,7 +725,7 @@ local READ_ONLY = {
   get_output = true, get_stats = true, get_tree = true, get_items = true,
   get_skills = true, get_build_info = true, get_config = true, calc_with = true,
   export_build_xml = true, search_nodes = true, get_mastery_options = true,
-  save_build = true, list_specs = true, list_item_sets = true,
+  save_build = true, list_specs = true, list_item_sets = true, get_ailments = true,
 }
 
 -- Opt-in per-action timing (handler vs encode), one line per request.
@@ -726,7 +742,7 @@ local PRISTINE_SAFE = {
   get_output = true, get_stats = true, get_tree = true, get_items = true,
   get_skills = true, get_build_info = true, get_config = true,
   search_nodes = true, get_mastery_options = true, list_specs = true, list_item_sets = true,
-  evaluate_anoint_candidates = true, calc_with = true,
+  evaluate_anoint_candidates = true, calc_with = true, get_ailments = true,
 }
 
 reply({ ok = true, ready = true, version = { adapter = 'vanilla-stdio-v2' } })

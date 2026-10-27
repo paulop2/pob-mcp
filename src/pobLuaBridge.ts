@@ -2,6 +2,11 @@ import { spawn, ChildProcessWithoutNullStreams } from "child_process";
 import { EventEmitter } from "events";
 import path from "path";
 import os from "os";
+import zlib from "zlib";
+import fs from "fs/promises";
+import { randomUUID } from "crypto";
+import { atomicWriteFile } from "./utils/atomicWrite.js";
+import { resolvePoBLayout } from "./utils/pobLayout.js";
 import { appendFileSync } from "fs";
 
 // Opt-in latency log: one JSON line per bridge round-trip.
@@ -12,6 +17,24 @@ type LuaRequest = { action: string; params?: Record<string, unknown> };
 /** Lua bridge response envelope — always an object with at minimum `ok: boolean` */
 type LuaResponse = { ok: boolean; error?: string; [key: string]: unknown };
 
+const ROCK_BY_LUA_MODULE: Record<string, string> = {
+  "lua-utf8": "luautf8",
+};
+
+/** PoB reports this on stdout and then blocks, so the bare symptom is a startup timeout. */
+function missingLuaModuleMessage(moduleName: string): string {
+  const rock = ROCK_BY_LUA_MODULE[moduleName];
+  return (
+    `Failed to start PoB Lua Bridge: PoB could not load the Lua module '${moduleName}'.\n\n` +
+    `PoB's C modules are committed to runtime/ as Windows .dll builds only, so a fresh\n` +
+    `PathOfBuilding checkout cannot supply them on macOS or Linux.\n\n` +
+    `Install it for LuaJIT (Lua 5.1):\n` +
+    `  luarocks --lua-version=5.1 --local install ${rock ?? moduleName}\n\n` +
+    `On Homebrew LuaJIT, add --lua-dir=$(brew --prefix luajit).\n` +
+    `This bridge already searches ~/.luarocks/lib/lua/5.1, so no extra config is needed.`
+  );
+}
+
 export interface PoBLuaApiOptions {
   cwd?: string;
   cmd?: string; // default: 'luajit'
@@ -20,7 +43,42 @@ export interface PoBLuaApiOptions {
   timeoutMs?: number; // per-request timeout
 }
 
+/**
+ * A non-damaging ailment as the engine sees it. `appliedEffect` is what the
+ * DPS calculation is actually crediting; `calculatedEffect` is what the skill
+ * would inflict on the configured enemy. They differ whenever the ailment is
+ * chance-based, because PoB only applies guaranteed or hand-configured ones.
+ */
+export interface AilmentReport {
+  name: string;
+  chanceOnHit: number;
+  chanceOnCrit: number;
+  effectMod?: number;
+  duration?: number;
+  /** Below this the ailment does not land at all. */
+  minimumEffect?: number;
+  maximumEffect?: number;
+  appliedEffect: number;
+  calculatedEffect?: number;
+  landsOnConfiguredEnemy?: boolean;
+  creditedInCalc: boolean;
+  /** PoB's own config var names, derived from its option list rather than guessed. */
+  effectConfigVar?: string;
+  enabledConfigVar?: string;
+  enabledOnEnemy?: boolean;
+  thresholdTable?: Array<{
+    ailmentThreshold: number;
+    effect: number;
+    note?: string;
+    isConfiguredEnemy?: boolean;
+  }>;
+}
+
 export class PoBLuaApiClient {
+  private loadedFilePath?: string;
+  private buildGeneration = 0;
+
+  getLoadedFilePath(): string | undefined { return this.loadedFilePath; }
   private proc: ChildProcessWithoutNullStreams | null = null;
   private options: PoBLuaApiOptions;
   private buffer = "";
@@ -37,9 +95,9 @@ export class PoBLuaApiClient {
   constructor(options: PoBLuaApiOptions = {}) {
     // Prevent unhandled 'error' events (emitted on process exit) from crashing Node.js
     this.dataEmitter.on("error", () => {});
-    const forkSrc = options.cwd || process.env.POB_PATH || process.env.POB_FORK_PATH || path.join(os.homedir(), "Projects", "PathOfBuilding", "src");
+    const forkSrc = options.cwd || process.env.POB_PATH || process.env.POB_FORK_PATH;
     this.options = {
-      cwd: forkSrc,
+      cwd: forkSrc,  // may be undefined; resolved by layout detection in start()
       cmd: options.cmd || "luajit",
       args: options.args || ["HeadlessWrapper.lua"],
       env: options.env || {},
@@ -56,30 +114,20 @@ export class PoBLuaApiClient {
     this.killed = false;
     this.ready = false;
     this.buffer = "";
+    this.loadedFilePath = undefined;
 
-    // Set up Lua paths for runtime modules
-    const pobForkPath = this.options.cwd!;
+    const layout = resolvePoBLayout(this.options.cwd);
+    this.options.cwd = layout.src;
 
-    // Cross-platform path handling: remove 'src' from the end if present
-    const baseDir = pobForkPath.endsWith(path.sep + 'src') || pobForkPath.endsWith('/src')
-      ? pobForkPath.slice(0, -4)
-      : pobForkPath;
-    const runtimeDir = path.join(baseDir, 'runtime');
-    const runtimeLuaPath = path.join(runtimeDir, 'lua');
-    const luaRocksPath = path.join(os.homedir(), '.luarocks', 'lib', 'lua', '5.1');
-
-    // Platform-specific Lua paths
-    const isWindows = process.platform === 'win32';
-    const luaExt = isWindows ? 'dll' : 'so';
-
-    // Lua's package.path/cpath list separator is ';' on ALL platforms
+    // ';' separates entries on ALL platforms; trailing ';;' appends Lua's defaults
     const luaSep = ';';
+    const toSearchPath = (entries: string[]) => entries.join(luaSep) + luaSep + luaSep;
 
     const env = {
       ...process.env,
       POB_API_STDIO: "1",
-      LUA_PATH: `${runtimeLuaPath}${path.sep}?.lua${luaSep}${runtimeLuaPath}${path.sep}?${path.sep}init.lua${luaSep}${luaSep}`,
-      LUA_CPATH: `${runtimeDir}${path.sep}?.${luaExt}${luaSep}${luaRocksPath}${path.sep}?.${luaExt}${luaSep}${luaSep}`,
+      LUA_PATH: toSearchPath(layout.luaPath),
+      LUA_CPATH: toSearchPath(layout.luaCPath),
       ...this.options.env,
     } as NodeJS.ProcessEnv;
 
@@ -167,6 +215,10 @@ export class PoBLuaApiClient {
 
         // Skip empty lines or lines that don't start with '{'
         if (!ready.trim() || !ready.trim().startsWith('{')) {
+          const missingModule = ready.match(/module '([\w.\-]+)' not found/);
+          if (missingModule) {
+            throw new Error(missingLuaModuleMessage(missingModule[1]));
+          }
           continue;
         }
 
@@ -316,19 +368,68 @@ export class PoBLuaApiClient {
   async newBuild(params?: { className?: string; ascendancy?: string }): Promise<any> {
     const res = await this.send({ action: "new_build", params: params || {} });
     if (!res.ok) throw new Error(res.error || "new_build failed");
+    this.loadedFilePath = undefined;
+    this.buildGeneration++;
     return res;
   }
 
-  async saveBuild(filePath: string): Promise<any> {
-    const res = await this.send({ action: "save_build", params: { path: filePath } });
-    if (!res.ok) throw new Error(res.error || "save_build failed");
-    return res.result;
+  async saveBuild(filePath: string, overwrite = false): Promise<any> {
+    const destination = path.resolve(filePath);
+    const mayReplace = overwrite || this.loadedFilePath === destination;
+    const generation = this.buildGeneration;
+    const temporary = path.join(path.dirname(destination), `.pob-save-${randomUUID()}.tmp`);
+    try {
+      const res = await this.send({ action: "save_build", params: { path: temporary } });
+      if (!res.ok) throw new Error(res.error || "save_build failed");
+      const xml = await fs.readFile(temporary, 'utf8');
+      await atomicWriteFile(destination, xml, mayReplace);
+      if (this.buildGeneration === generation) this.loadedFilePath = destination;
+      return { ...res.result as any, path: destination };
+    } catch (error: any) {
+      if (error.code === 'EEXIST') {
+        throw new Error(`Refusing to overwrite existing build "${destination}". Pass overwrite: true to replace it, or choose a new name.`);
+      }
+      throw error;
+    } finally {
+      await fs.unlink(temporary).catch((error: any) => { if (error.code !== 'ENOENT') throw error; });
+    }
   }
 
-  async loadBuildXml(xml: string, name = "API Build"): Promise<any> {
+  async loadBuildXml(xml: string, name = "API Build", sourcePath?: string): Promise<any> {
+    // A failed import may already have closed the previous native build.
+    this.loadedFilePath = undefined;
+    this.buildGeneration++;
     const res = await this.send({ action: "load_build_xml", params: { xml, name } });
     if (!res.ok) throw new Error(res.error || "load_build_xml failed");
+    this.loadedFilePath = sourcePath ? path.resolve(sourcePath) : undefined;
     return res;
+  }
+
+  /**
+   * Decodes a PoB import/export code (URL-safe base64 + zlib deflate — the
+   * format PoB's desktop Import tab produces/consumes) and loads the
+   * resulting build XML. Decoding happens here, not in the Lua bridge,
+   * because the headless engine's own Inflate/Deflate are stubs that always
+   * return "" — the real implementation lives in the native SimpleGraphic
+   * host the desktop app links against, which headless mode has none of.
+   */
+  async importCode(code: string, name = "Imported Build"): Promise<any> {
+    const b64 = code.trim().replace(/-/g, "+").replace(/_/g, "/");
+    const compressed = Buffer.from(b64, "base64");
+
+    let xml: string;
+    try {
+      xml = zlib.inflateSync(compressed).toString("utf8");
+    } catch (zlibErr) {
+      try {
+        xml = zlib.inflateRawSync(compressed).toString("utf8");
+      } catch {
+        const msg = zlibErr instanceof Error ? zlibErr.message : String(zlibErr);
+        throw new Error(`Failed to decode import code: ${msg}`);
+      }
+    }
+
+    return this.loadBuildXml(xml, name);
   }
 
   async getStats(fields?: string[]): Promise<Record<string, any>> {
@@ -432,10 +533,25 @@ async setTree(params: {
     return res.config;
   }
 
-  async setConfig(params: Record<string, any>): Promise<any> {
+  /** Human-facing labels for dropdown config values (bandit "None" -> "Kill all"). */
+  async getConfigLabels(): Promise<Record<string, string>> {
+    const res = await this.send({ action: "get_config" });
+    if (!res.ok) throw new Error(res.error || "get_config failed");
+    return (res.labels as Record<string, string>) ?? {};
+  }
+
+  async setConfig(params: Record<string, any>): Promise<{
+    applied: Record<string, any>;
+    rejected: Record<string, string>;
+    config: Record<string, any>;
+  }> {
     const res = await this.send({ action: "set_config", params });
     if (!res.ok) throw new Error(res.error || "set_config failed");
-    return res.config;
+    return {
+      applied: (res.applied as Record<string, any>) ?? {},
+      rejected: (res.rejected as Record<string, string>) ?? {},
+      config: (res.config as Record<string, any>) ?? {},
+    };
   }
 
   async createSocketGroup(params?: { label?: string; slot?: string; enabled?: boolean; includeInFullDPS?: boolean }): Promise<any> {
@@ -487,10 +603,15 @@ async setTree(params: {
     return res.results;
   }
 
-  async updateTreeDelta(params: { addNodes?: number[]; removeNodes?: number[]; classId?: number; ascendClassId?: number; secondaryAscendClassId?: number; treeVersion?: string; }): Promise<{ tree: any; autoPathedNodes?: number[]; skippedAscendancyNodes?: number[] }> {
+  async updateTreeDelta(params: { addNodes?: number[]; removeNodes?: number[]; masteryEffects?: Record<string, number>; classId?: number; ascendClassId?: number; secondaryAscendClassId?: number; treeVersion?: string; }): Promise<{ tree: any; autoPathedNodes?: number[]; skippedAscendancyNodes?: number[]; droppedNodes?: number[] }> {
     const res = await this.send({ action: "update_tree_delta", params });
     if (!res.ok) throw new Error(res.error || "update_tree_delta failed");
-    return { tree: res.tree, autoPathedNodes: res.autoPathedNodes as number[] | undefined, skippedAscendancyNodes: res.skippedAscendancyNodes as number[] | undefined };
+    return {
+      tree: res.tree,
+      autoPathedNodes: res.autoPathedNodes as number[] | undefined,
+      skippedAscendancyNodes: res.skippedAscendancyNodes as number[] | undefined,
+      droppedNodes: res.droppedNodes as number[] | undefined,
+    };
   }
 
   async calcWith(params: { addNodes?: number[]; removeNodes?: number[]; masteryEffects?: Record<string | number, number>; useFullDPS?: boolean; fields?: string[] }): Promise<any> {
@@ -503,6 +624,16 @@ async setTree(params: {
     const res = await this.send({ action: "get_mastery_options" });
     if (!res.ok) throw new Error(res.error || "get_mastery_options failed");
     return res.result;
+  }
+
+  async getAilments(): Promise<{ ailments: AilmentReport[] }> {
+    const res = await this.send({ action: "get_ailments" });
+    if (!res.ok) throw new Error(res.error || "get_ailments failed");
+    const result = res.result;
+    if (!result || typeof result !== "object" || !Array.isArray((result as { ailments?: unknown }).ailments)) {
+      throw new Error("get_ailments returned an unexpected shape");
+    }
+    return result as { ailments: AilmentReport[] };
   }
 
   async evaluateAnointCandidates(params: { slot: string; focus?: 'dps' | 'defence' | 'both'; limit?: number }): Promise<{

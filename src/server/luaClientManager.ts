@@ -5,6 +5,7 @@
  */
 
 import { PoBLuaApiClient } from '../pobLuaBridge.js';
+import { BOOTSTRAP_BUILD_NAME } from './bootstrapBuild.js';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -86,13 +87,14 @@ export class LuaClientManager {
 
       // Wait for HeadlessWrapper to be fully ready (loadBuildFromXML available)
       console.error('[Lua Bridge] Waiting for HeadlessWrapper to finish loading...');
-      const testXml = '<?xml version="1.0" encoding="UTF-8"?><PathOfBuilding><Build level="1" className="Witch"/></PathOfBuilding>';
+      // Omitting targetVersion opens PoB's legacy conversion prompt and leaves initialization incomplete.
+      const testXml = '<?xml version="1.0" encoding="UTF-8"?><PathOfBuilding><Build level="1" targetVersion="3_0" className="Witch"/></PathOfBuilding>';
       let attempts = 0;
       const maxAttempts = 5;
 
       while (attempts < maxAttempts) {
         try {
-          await stdioClient.loadBuildXml(testXml, 'Init Test');
+          await stdioClient.loadBuildXml(testXml, BOOTSTRAP_BUILD_NAME);
           console.error('[Lua Bridge] HeadlessWrapper fully initialized');
           break;
         } catch (loadError) {

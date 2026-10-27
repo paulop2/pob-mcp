@@ -208,6 +208,86 @@ export function getToolSchemas(): ToolSchema[] {
         required: ["build_name", "notes"],
       },
     },
+    {
+      name: "classify_item_affixes",
+      description: "Resolve an item's explicit mod lines back to the affixes that produced them, using Path of Building's ModExplicit (legacy ModItem) and ModMaster tables. Reports matched prefix and suffix counts, remaining slots when the classification is complete and unambiguous, affix ranges and minimum item levels, and which lines belong to one hybrid affix. USE THIS BEFORE recommending any craft or reroll: one affix can print several lines, and counting those lines separately inverts the answer (a hybrid energy shield prefix also prints stun recovery, which reads like a suffix). LIMITS: explicit mods only. Unmatched lines may be unrecognized explicit affixes that still occupy slots. Remaining slots are reported as unknown when any lines are unmatched or ambiguous. An item whose lines admit more than one reading is flagged as ambiguous rather than guessed. Slot counts assume a rare, which holds three prefixes and three suffixes; a magic item holds one of each.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          mod_lines: {
+            type: "array",
+            items: { type: "string" },
+            description: "The item's mod lines, one per entry, exactly as printed (e.g. '+42 to maximum Life'). PoB tags such as {crafted} are stripped automatically.",
+          },
+        },
+        required: ["mod_lines"],
+      },
+    },
+    {
+      name: "list_craftable_mods",
+      description: "List the crafting bench mods an item class can take at a given item level, from Path of Building's ModMaster table. Use it to answer 'what can I put in the open suffix', and to say what a higher item level would unlock. A craft occupies a slot of its own type, so check the type of the affix being replaced, not only the one being added. LIMITS: bench crafts only, no essences, fossils or veiled mods, and no metacrafting. It does not know what the item already has, so pair it with classify_item_affixes.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          item_class: {
+            type: "string",
+            description: "Item class as PoB names it: 'Body Armour', 'Helmet', 'Gloves', 'Boots', 'Shield', 'Ring', 'Amulet', 'Belt', 'Quiver', 'Wand', 'Bow', 'Staff', 'Sceptre', 'Dagger', 'Claw', 'One Handed Sword', and so on. A wrong value returns the full list of known classes.",
+          },
+          item_level: {
+            type: "number",
+            description: "The item's item level. Crafts requiring a higher level are reported separately rather than hidden.",
+          },
+          affix_type: {
+            type: "string",
+            enum: ["Prefix", "Suffix"],
+            description: "Restrict to the slot type you actually have open.",
+          },
+          search: {
+            type: "string",
+            description: "Optional wording, affix name, group or mod tag filter (e.g. 'Cold Resistance', 'life').",
+          },
+        },
+        required: ["item_class", "item_level"],
+      },
+    },
+    {
+      name: "find_affix_tiers",
+      description: "Look up every tier of a rollable affix in Path of Building's ModExplicit table (ModItem on older installs): prefix or suffix, minimum item level, the value range per entry, and the base tags it can roll on. Displays affix names and item levels without inventing T1/T2 labels from filtered result order. Use it to price an affix before pricing an item, since a top-tier rare suffix often replaces a costly unique built around the same stat. LIMITS: slot filtering uses PoB's base tags, not slot names. Body armour bases carry str_armour / dex_armour / int_armour and their hybrids; influenced variants add a suffix like _elder or _shaper; a plain 'armour' tag exists too and does not cover the attribute-specific ones. Pass several tags when unsure. Mods whose spawn weights are all zero are excluded unless include_unobtainable is set.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          search: {
+            type: "string",
+            description: "Stat wording, affix name, group or mod tag (e.g. 'Chaos Resistance', 'of Bameth', 'ChaosResistance').",
+          },
+          affix_type: {
+            type: "string",
+            enum: ["Prefix", "Suffix"],
+            description: "Restrict to prefixes or suffixes.",
+          },
+          slot_tags: {
+            type: "array",
+            items: { type: "string" },
+            description: "PoB base tags the mod must be able to roll on, matched exactly, any one of them. Examples: 'ring', 'amulet', 'belt', 'int_armour', 'body_armour', 'bow'.",
+          },
+          max_item_level: {
+            type: "number",
+            description: "Drop tiers the item level cannot reach.",
+          },
+          include_unobtainable: {
+            type: "boolean",
+            description: "Include mods with no non-zero spawn weight. They exist in the data but nothing can roll them. Default false.",
+            default: false,
+          },
+          max_results: {
+            type: "number",
+            description: "Maximum affix groups to return (default 10).",
+            default: 10,
+          },
+        },
+        required: ["search"],
+      },
+    },
   ];
 }
 
@@ -256,13 +336,18 @@ export function getLuaToolSchemas(): any[] {
     },
     {
       name: "lua_save_build",
-      description: "Save the currently loaded in-memory Lua bridge build to a file. Required before using file-based tools (validate_build, analyze_build, etc.) on an in-memory build.",
+      description: "Save the currently loaded in-memory Lua bridge build atomically. Saving back to its source file is allowed; replacing another existing file requires overwrite=true. Required before using file-based tools (validate_build, analyze_build, etc.) on an in-memory build.",
       inputSchema: {
         type: "object",
         properties: {
           build_name: {
             type: "string",
             description: "Output filename (e.g., 'MyBuild.xml'). .xml extension added automatically if missing.",
+          },
+          overwrite: {
+            type: "boolean",
+            description: "Explicitly allow replacing a different existing build file (default: false).",
+            default: false,
           },
         },
         required: ["build_name"],
@@ -287,6 +372,24 @@ export function getLuaToolSchemas(): any[] {
             description: "Display name for the loaded build (optional; defaults to the build filename when build_name is used)",
           },
         },
+      },
+    },
+    {
+      name: "lua_import_code",
+      description: "Import a PoB build/passive-tree export code (the string generated by PoB's 'Generate' button or a pobb.in-style share code — URL-safe base64 + zlib deflate) directly into the PoB calculation engine. AUTO-RETURNS a brief summary (life, DPS, EHP, resistances, top issues), same as lua_load_build. Follow up with lua_save_build to persist it to a file.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          code: {
+            type: "string",
+            description: "The PoB import/export code to decode and load.",
+          },
+          name: {
+            type: "string",
+            description: "Display name for the imported build (optional; defaults to 'Imported Build').",
+          },
+        },
+        required: ["code"],
       },
     },
     {
@@ -371,6 +474,11 @@ export function getLuaToolSchemas(): any[] {
       },
     },
     {
+      name: "lua_get_ailments",
+      description: "Show non-damaging ailments (Shock, Chill, Scorch, Brittle, Sap) with what the DPS calculation is actually crediting next to what the main skill would inflict on the configured enemy. Call this for any build that shocks or chills: PoB applies a chance-based ailment only when its magnitude is entered by hand, so an uncounted shock silently understates every DPS figure. Magnitude is measured for the MAIN skill against the CURRENT enemy config, and it falls off steeply with enemy life, so re-read it per enemy rather than quoting one number for all content.",
+      inputSchema: { type: "object", properties: {} },
+    },
+    {
       name: "lua_get_stats",
       description: "Get comprehensive calculated stats from the currently loaded build (requires lua_load_build first). Use category='offense' for DPS details, category='defense' for survivability, category='all' only when you need everything at once. Avoid calling multiple times with different categories — pick the right one.",
       inputSchema: {
@@ -415,6 +523,11 @@ export function getLuaToolSchemas(): any[] {
             type: "number",
             description: "Ascendancy class ID (0=None, 1-3 class-specific). Scion: 1=Ascendant | Marauder: 1=Juggernaut, 2=Berserker, 3=Chieftain | Ranger: 1=Raider, 2=Deadeye, 3=Pathfinder | Witch: 1=Occultist, 2=Elementalist, 3=Necromancer | Duelist: 1=Slayer, 2=Gladiator, 3=Champion | Templar: 1=Inquisitor, 2=Hierophant, 3=Guardian | Shadow: 1=Assassin, 2=Trickster, 3=Saboteur",
           },
+          masteryEffects: {
+            type: "object",
+            description: "Map of mastery node ID -> chosen effect ID (from get_mastery_options). A Mastery node with no effect selection is silently dropped by the tree import, so provide one entry per mastery node you want allocated. Existing mastery selections already on the build are preserved automatically and only need to be listed here if you want to change them.",
+            additionalProperties: { type: "number" },
+          },
         },
         required: ["nodes"],
       },
@@ -434,6 +547,11 @@ export function getLuaToolSchemas(): any[] {
             type: "array",
             items: { type: "string" },
             description: "Node IDs to remove from the current allocation",
+          },
+          mastery_effects: {
+            type: "object",
+            additionalProperties: { type: "number" },
+            description: "Effect to select for each Mastery node being added, as {\"<nodeId>\": <effectId>}. Required to allocate a Mastery: Path of Building refuses to allocate a Mastery node that has no effect chosen. Use suggest_masteries or search_tree_nodes to find effect IDs.",
           },
         },
       },
