@@ -592,7 +592,7 @@ local READ_ONLY = {
   get_output = true, get_stats = true, get_tree = true, get_items = true,
   get_skills = true, get_build_info = true, get_config = true, calc_with = true,
   export_build_xml = true, search_nodes = true, get_mastery_options = true,
-  save_build = true, list_specs = true, list_item_sets = true,
+  save_build = true, list_specs = true, list_item_sets = true, get_ailments = true,
 }
 
 -- Opt-in per-action timing (handler vs encode), one line per request.
@@ -609,7 +609,7 @@ local PRISTINE_SAFE = {
   get_output = true, get_stats = true, get_tree = true, get_items = true,
   get_skills = true, get_build_info = true, get_config = true,
   search_nodes = true, get_mastery_options = true, list_specs = true, list_item_sets = true,
-  evaluate_anoint_candidates = true, calc_with = true,
+  evaluate_anoint_candidates = true, calc_with = true, get_ailments = true,
 }
 
 reply({ ok = true, ready = true, version = { adapter = 'vanilla-stdio-v2' } })
