@@ -97,12 +97,29 @@ function M.invalidate()
   M.miscCalc, M.miscCalcBase = nil, nil
 end
 
+-- Recalculate the way Build:OnFrame does when buildFlag is set (Build.lua:1258).
+-- Without wipeGlobalCache the new pass reuses per-skill results GlobalCache
+-- kept from the previous one (other skills' ailments, triggers, minions...)
+-- and disagrees with a fresh load of the same build; RefreshStatList is what
+-- sorts output.SkillDPS by DPS after a load.
+function M.recalculate()
+  if wipeGlobalCache then wipeGlobalCache() end
+  build.outputRevision = (build.outputRevision or 0) + 1
+  build.buildFlag = false
+  if build.skillsTab and build.skillsTab.UpdateSocketGroups then build.skillsTab:UpdateSocketGroups() end
+  build.calcsTab:BuildOutput()
+  if build.RefreshStatList then build:RefreshStatList() end
+  if build.configTab then
+    build.configTab.calcFunc, build.configTab.calcBase = build.calcsTab:GetMiscCalculator()
+  end
+end
+
 function M.get_main_output()
   if not build or not build.calcsTab then
     return nil, "build not initialized"
   end
   if M.dirty and build.calcsTab.BuildOutput then
-    build.calcsTab:BuildOutput()
+    M.recalculate()
   end
   M.dirty = false
   local output = build.calcsTab and build.calcsTab.mainOutput or nil
