@@ -1141,7 +1141,7 @@ function M.create_spec(params)
     end
   end
   local version = (source and source.treeVersion) or (build.spec and build.spec.treeVersion) or latestTreeVersion
-  local newSpec = new('PassiveSpec', build, version)
+  local newSpec = new('PassiveSpec'):PassiveSpec(build, version)
   if source then
     -- Same copy mechanism TreeTab uses for its spec management popup
     newSpec.jewels = copyTable(source.jewels)

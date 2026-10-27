@@ -143,6 +143,125 @@ local function restoreSharedData()
   end
 end
 
+-- While TreeTab:Load reads a build's specs, PoB rebuilds every spec's node
+-- paths (PassiveSpec:BuildAllDependsAndPaths, a walk over the whole tree) once
+-- in the constructor and three more times inside ImportFromNodeList (SelectClass,
+-- SelectAscendClass, SelectSecondaryAscendClass) before the rebuild that counts,
+-- at its end. Nothing reads paths in between, so during TreeTab:Load the
+-- rebuilds are only recorded and run once per spec, before the first thing
+-- that reads the result: Load's closing ResetUndo, SetActiveSpec, or the end
+-- of TreeTab:Load.
+do
+  local classes = common and common.classes
+  local Spec, TreeTab = classes and classes.PassiveSpec, classes and classes.TreeTab
+  if Spec and TreeTab and Spec.BuildAllDependsAndPaths and Spec.ImportFromNodeList
+      and Spec.ResetUndo and TreeTab.Load and TreeTab.SetActiveSpec then
+    local rebuild = Spec.BuildAllDependsAndPaths
+    local deferring = false
+    local pending = setmetatable({}, { __mode = 'k' })
+    local function flush(spec)
+      if pending[spec] then
+        pending[spec] = nil
+        rebuild(spec)
+      end
+    end
+    local function flushAll(treeTab)
+      for _, spec in ipairs(treeTab.specList or {}) do flush(spec) end
+    end
+    -- Run fn with deferral switched to `on`, restoring the previous state even
+    -- when fn raises.
+    local function withDeferral(on, fn, ...)
+      local previous = deferring
+      deferring = on
+      local result = { pcall(fn, ...) }
+      deferring = previous
+      if not result[1] then error(result[2], 0) end
+      return unpack(result, 2, table.maxn(result))
+    end
+    Spec.BuildAllDependsAndPaths = function(self, ...)
+      if deferring then
+        pending[self] = true
+        return
+      end
+      return rebuild(self, ...)
+    end
+    -- PassiveSpec:Load ends with ResetUndo, which snapshots the allocation the
+    -- last rebuild settled. (ImportFromNodeList itself is not wrapped: pob_ops
+    -- tells its signature apart by the parameter count.)
+    local resetUndo = Spec.ResetUndo
+    Spec.ResetUndo = function(self, ...)
+      flush(self)
+      return resetUndo(self, ...)
+    end
+    local treeLoad, setActiveSpec = TreeTab.Load, TreeTab.SetActiveSpec
+    TreeTab.Load = function(self, ...)
+      local result = { withDeferral(true, treeLoad, self, ...) }
+      flushAll(self)
+      for spec in pairs(pending) do flush(spec) end
+      return unpack(result, 1, table.maxn(result))
+    end
+    TreeTab.SetActiveSpec = function(self, ...)
+      if not deferring then return setActiveSpec(self, ...) end
+      flushAll(self)
+      return withDeferral(false, setActiveSpec, self, ...)
+    end
+  else
+    io.stderr:write('pob-mcp: PassiveSpec/TreeTab not as expected; spec path rebuilds are not deferred\n')
+  end
+end
+
+-- Which tinctures apply must not depend on table addresses. mergeTinctures
+-- (Modules/CalcPerform.lua:1905) walks `env.tinctures` with pairs() and stops
+-- after `TinctureLimit` items. The set is keyed by item objects, so with more
+-- active tinctures than the limit the one that applies follows pointer hash
+-- order, which changes between processes and with allocation history (e.g. a
+-- Pathfinder with two tinctures and limit 1: CritChance 35 or 97.4). Before
+-- each perform, keep only the first `limit` tinctures in slot order (Flask 1..5,
+-- the order initEnv inserts them in; a misc-calculator repItem takes the slot
+-- it replaces). The rest would have been skipped anyway, so with at most
+-- `limit` active nothing changes. Same rule as pob-oracle's reference.
+do
+  local function tinctureSlotOrder(env)
+    local order, seen = {}, {}
+    local itemsTab = env.build and env.build.itemsTab
+    local override = env.override or {}
+    if itemsTab and itemsTab.orderedSlots then
+      for _, slot in ipairs(itemsTab.orderedSlots) do
+        local item = itemsTab.items[slot.selItemId]
+        if override.repSlotName == slot.slotName and override.repItem then item = override.repItem end
+        if item and env.tinctures[item] and not seen[item] then
+          order[#order + 1], seen[item] = item, true
+        end
+      end
+    end
+    -- Not found in a slot (e.g. a toggleTincture override): stable by text.
+    local rest = {}
+    for item in pairs(env.tinctures) do
+      if not seen[item] then rest[#rest + 1] = item end
+    end
+    table.sort(rest, function(a, b)
+      return tostring(a.raw or a.name or '') < tostring(b.raw or b.name or '')
+    end)
+    for _, item in ipairs(rest) do order[#order + 1] = item end
+    return order
+  end
+
+  local okCalcs, calcs = pcall(require, 'Modules.Calcs')
+  if okCalcs and type(calcs) == 'table' and type(calcs.perform) == 'function' then
+    local perform = calcs.perform
+    calcs.perform = function(env, ...)
+      if type(env) == 'table' and type(env.tinctures) == 'table' and next(env.tinctures) and env.modDB then
+        local limit = math.max(env.modDB:Sum('BASE', nil, 'TinctureLimit'), 0)
+        local order = tinctureSlotOrder(env)
+        for i = limit + 1, #order do env.tinctures[order[i]] = nil end
+      end
+      return perform(env, ...)
+    end
+  else
+    io.stderr:write('pob-mcp: Modules.Calcs not found; tincture order is left to PoB\n')
+  end
+end
+
 local BuildOps = dofile(ADAPTER_DIR .. 'pob_ops.lua')
 
 -- Set when the last load_build_xml failed: the bridge then refuses to report
@@ -159,6 +278,16 @@ local function closePopups()
   return titles
 end
 
+-- Build:Init creates the new ItemsTab while `build.spec` still points at the
+-- outgoing build's spec (TreeTab replaces it later). Every jewel socket slot
+-- then reads that spec's jewels, writes 0 into them and rebuilds its cluster
+-- jewel graphs (ItemSlotControl.lua:73-88): a full path rebuild of a tree that
+-- is about to be thrown away, once per socket. A fresh process has no spec at
+-- that point; detaching it gives the same new build without that work.
+local function detachSpec()
+  if build then build.spec = nil end
+end
+
 -- Load a build without inheriting anything from the outgoing one, and fail
 -- loudly instead of leaving the previous build's output in place.
 local function loadFresh(xml, name)
@@ -170,9 +299,11 @@ local function loadFresh(xml, name)
   if build and build.spec then build.spec.subGraphs = {} end
   -- Loading straight over another build can read the outgoing build's tabs
   -- (e.g. a stale activeSpec index); passing through an empty build resets them.
+  detachSpec()
   _G.newBuild()
   restoreSharedData()
   local stale = build and build.calcsTab and build.calcsTab.mainOutput
+  detachSpec()
   _G.loadBuildFromXML(xml, name)
   local prompt = __mainObject__.promptMsg
   __mainObject__.promptMsg = nil
@@ -185,6 +316,7 @@ local function loadFresh(xml, name)
   local popup = main and main.popups and main.popups[1]
   if popup and #main.popups == 1 and popup.title == 'Game Version'
       and popup.controls and popup.controls.convert and popup.controls.convert.onClick then
+    detachSpec()
     popup.controls.convert.onClick()
     converted = true
   end
@@ -358,6 +490,7 @@ end
 handlers.new_build = function(params)
   if not _G.newBuild then return { ok = false, error = 'headless wrapper not initialized' } end
   if build and build.spec then build.spec.subGraphs = {} end
+  detachSpec()
   _G.newBuild()
   restoreSharedData()
   lastLoadError = nil
