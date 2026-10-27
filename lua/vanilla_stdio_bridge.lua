@@ -337,6 +337,8 @@ handlers.load_build_xml = function(params)
     return { ok = false, error = lastLoadError }
   end
   lastLoadError = nil
+  -- The load just calculated the build; the next read needs no recalculation.
+  BuildOps.dirty = false
   return { ok = true, build_id = 1, converted = res == true or nil }
 end
 
@@ -453,6 +455,20 @@ handlers.get_config = op(BuildOps.get_config, 'config')
 handlers.calc_with = function(params)
   local out, err = BuildOps.calc_with(params or {})
   if out == nil then return { ok = false, error = err or 'operation failed' } end
+  -- `fields` limits the reply to the named top-level stats: a whole output is
+  -- tens of KB, while a candidate search usually reads two or three numbers.
+  if type(params) == 'table' and type(params.fields) == 'table' then
+    local picked = {}
+    for _, name in ipairs(params.fields) do
+      local v = out[name]
+      if type(v) == 'table' then
+        if getmetatable(v) == nil then picked[name] = plainCopy(v, {}, 0) end
+      elseif v ~= nil then
+        picked[name] = v
+      end
+    end
+    return { ok = true, output = picked }
+  end
   return { ok = true, output = plainCopy(out, {}, 0) }
 end
 handlers.export_build_xml = op(BuildOps.export_build_xml, 'xml')
@@ -488,6 +504,16 @@ local LOAD_INDEPENDENT = {
   new_build = true, load_build_xml = true,
 }
 
+-- Actions that only read the build. Any other action may change it, so the
+-- cached output and misc calculator are invalidated before it runs.
+local READ_ONLY = {
+  ping = true, version = true, get_capabilities = true, diagnostics = true,
+  get_output = true, get_stats = true, get_tree = true, get_items = true,
+  get_skills = true, get_build_info = true, get_config = true, calc_with = true,
+  export_build_xml = true, search_nodes = true, get_mastery_options = true,
+  save_build = true, list_specs = true, list_item_sets = true,
+}
+
 reply({ ok = true, ready = true, version = { adapter = 'vanilla-stdio-v2' } })
 for line in io.lines() do
   local request = json.decode(line)
@@ -502,6 +528,7 @@ for line in io.lines() do
   elseif lastLoadError and not LOAD_INDEPENDENT[action] then
     reply({ ok = false, error = 'last build load failed: ' .. lastLoadError })
   else
+    if not READ_ONLY[action] then BuildOps.invalidate() end
     local ok, res = pcall(handler, params)
     if not ok then
       reply({ ok = false, error = tostring(res) })

@@ -18,13 +18,23 @@ local MAX_PLAYER_LEVEL = 100
 local NUM_FLASK_SLOTS = 5
 local MAX_ITEM_TEXT_LENGTH = 10240  -- 10KB
 
+-- Set by the adapter before any action that may change the build; a full
+-- recalculation only runs when something could have changed since the last one.
+M.dirty = true
+
+function M.invalidate()
+  M.dirty = true
+  M.miscCalc, M.miscCalcBase = nil, nil
+end
+
 function M.get_main_output()
   if not build or not build.calcsTab then
     return nil, "build not initialized"
   end
-  if build.calcsTab.BuildOutput then
+  if M.dirty and build.calcsTab.BuildOutput then
     build.calcsTab:BuildOutput()
   end
+  M.dirty = false
   local output = build.calcsTab and build.calcsTab.mainOutput or nil
   if not output then
     return nil, "no output available"
@@ -195,7 +205,12 @@ end
 -- params: { addNodes?: number[], removeNodes?: number[], masteryEffects?: {[nodeId]: effectId}, useFullDPS?: boolean }
 function M.calc_with(params)
   if not build or not build.calcsTab then return nil, 'build not initialized' end
-  local calcFunc, baseOut = build.calcsTab:GetMiscCalculator()
+  -- GetMiscCalculator runs a full base calculation; reuse it until the build
+  -- changes (M.invalidate, called by the adapter before any changing action).
+  if not M.miscCalc then
+    M.miscCalc, M.miscCalcBase = build.calcsTab:GetMiscCalculator()
+  end
+  local calcFunc, baseOut = M.miscCalc, M.miscCalcBase
   local override = {}
   if params and type(params.addNodes) == 'table' then
     override.addNodes = {}
