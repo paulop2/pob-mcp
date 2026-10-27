@@ -144,10 +144,22 @@ local function loadFresh(xml, name)
   local prompt = __mainObject__.promptMsg
   __mainObject__.promptMsg = nil
   if prompt then error('PoB prompt: ' .. tostring(prompt), 0) end
+  -- A build without a supported targetVersion (old saves, minimal XML) opens
+  -- the "Game Version" conversion popup. Do what its default button does in the
+  -- GUI: convert to the current game version, which reloads the build.
+  local converted = false
+  local main = __mainObject__.main
+  local popup = main and main.popups and main.popups[1]
+  if popup and #main.popups == 1 and popup.title == 'Game Version'
+      and popup.controls and popup.controls.convert and popup.controls.convert.onClick then
+    popup.controls.convert.onClick()
+    converted = true
+  end
   local popups = closePopups()
   if #popups > 0 then error('PoB opened a popup: ' .. table.concat(popups, ' | '), 0) end
   local output = build and build.calcsTab and build.calcsTab.mainOutput
   if not output or output == stale then error('build did not produce a fresh calculation', 0) end
+  return converted
 end
 
 local function reply(value)
@@ -319,13 +331,13 @@ end
 handlers.load_build_xml = function(params)
   if not params or type(params.xml) ~= 'string' then return { ok = false, error = 'missing xml' } end
   if not _G.loadBuildFromXML then return { ok = false, error = 'headless wrapper not initialized' } end
-  local ok, err = pcall(loadFresh, params.xml, (params.name and tostring(params.name)) or 'API Build')
+  local ok, res = pcall(loadFresh, params.xml, (params.name and tostring(params.name)) or 'API Build')
   if not ok then
-    lastLoadError = tostring(err)
+    lastLoadError = tostring(res)
     return { ok = false, error = lastLoadError }
   end
   lastLoadError = nil
-  return { ok = true, build_id = 1 }
+  return { ok = true, build_id = 1, converted = res == true or nil }
 end
 
 -- Flatten nested output tables into dotted keys. Only plain data is followed:
