@@ -159,6 +159,16 @@ local function closePopups()
   return titles
 end
 
+-- Build:Init creates the new ItemsTab while `build.spec` still points at the
+-- outgoing build's spec (TreeTab replaces it later). Every jewel socket slot
+-- then reads that spec's jewels, writes 0 into them and rebuilds its cluster
+-- jewel graphs (ItemSlotControl.lua:73-88): a full path rebuild of a tree that
+-- is about to be thrown away, once per socket. A fresh process has no spec at
+-- that point; detaching it gives the same new build without that work.
+local function detachSpec()
+  if build then build.spec = nil end
+end
+
 -- Load a build without inheriting anything from the outgoing one, and fail
 -- loudly instead of leaving the previous build's output in place.
 local function loadFresh(xml, name)
@@ -170,9 +180,11 @@ local function loadFresh(xml, name)
   if build and build.spec then build.spec.subGraphs = {} end
   -- Loading straight over another build can read the outgoing build's tabs
   -- (e.g. a stale activeSpec index); passing through an empty build resets them.
+  detachSpec()
   _G.newBuild()
   restoreSharedData()
   local stale = build and build.calcsTab and build.calcsTab.mainOutput
+  detachSpec()
   _G.loadBuildFromXML(xml, name)
   local prompt = __mainObject__.promptMsg
   __mainObject__.promptMsg = nil
@@ -185,6 +197,7 @@ local function loadFresh(xml, name)
   local popup = main and main.popups and main.popups[1]
   if popup and #main.popups == 1 and popup.title == 'Game Version'
       and popup.controls and popup.controls.convert and popup.controls.convert.onClick then
+    detachSpec()
     popup.controls.convert.onClick()
     converted = true
   end
@@ -354,6 +367,7 @@ end
 handlers.new_build = function(params)
   if not _G.newBuild then return { ok = false, error = 'headless wrapper not initialized' } end
   if build and build.spec then build.spec.subGraphs = {} end
+  detachSpec()
   _G.newBuild()
   restoreSharedData()
   lastLoadError = nil
