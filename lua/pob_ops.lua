@@ -114,6 +114,15 @@ function M.get_tree()
   return out
 end
 
+-- Node replacements (tattoos, runegrafts) of the current spec. ImportFromNodeList
+-- installs exactly the overrides it is given, so re-importing a tree without
+-- them would silently strip every tattoo.
+function M.current_hash_overrides()
+  local overrides = {}
+  for id, override in pairs(build.spec.hashOverrides or {}) do overrides[id] = override end
+  return overrides
+end
+
 -- params: { classId, ascendClassId, secondaryAscendClassId?, nodes:[int], masteryEffects?:{[id]=effect}, treeVersion? }
 function M.set_tree(params)
   if not build or not build.spec then
@@ -131,9 +140,18 @@ function M.set_tree(params)
       table.insert(nodes, tonumber(v))
     end
   end
-  local mastery = params.masteryEffects or {}
+  -- PoB keys mastery selections by numeric node id; JSON object keys arrive as
+  -- strings, and a selection PoB cannot find leaves its mastery unallocated.
+  -- Without masteryEffects the current selections are kept.
+  local mastery = {}
+  local source = params.masteryEffects
+  if type(source) ~= 'table' then source = build.spec.masterySelections or {} end
+  for nodeId, effectId in pairs(source) do
+    local id, eid = tonumber(nodeId), tonumber(effectId)
+    if id and eid then mastery[id] = eid end
+  end
   local treeVersion = params.treeVersion
-  M.import_from_node_list(build.spec, classId, ascendId, secondaryId, nodes, {}, mastery, treeVersion)
+  M.import_from_node_list(build.spec, classId, ascendId, secondaryId, nodes, M.current_hash_overrides(), mastery, treeVersion)
   M.get_main_output()
   return true
 end
@@ -196,7 +214,7 @@ function M.update_tree_delta(params)
   local ascendId = params.ascendClassId or current.ascendClassId or 0
   local secId = params.secondaryAscendClassId or current.secondaryAscendClassId or 0
   local tv = params.treeVersion or current.treeVersion
-  M.import_from_node_list(build.spec, tonumber(classId) or 0, tonumber(ascendId) or 0, tonumber(secId) or 0, nodes, {}, mastery, tv)
+  M.import_from_node_list(build.spec, tonumber(classId) or 0, tonumber(ascendId) or 0, tonumber(secId) or 0, nodes, M.current_hash_overrides(), mastery, tv)
   M.get_main_output()
   return true
 end
@@ -226,23 +244,35 @@ function M.calc_with(params)
       if n then override.removeNodes[n] = true end
     end
   end
-  -- Temporarily override mastery selections for simulation
-  local origMastery = nil
+  -- Mastery choices: the calculation reads a mastery's stats from its node, not
+  -- from spec.masterySelections, so simulate a different choice the way PoB's
+  -- node power does: swap the allocated mastery node for a copy carrying the
+  -- other effect's stats. Choices equal to the current one change nothing.
   if params and type(params.masteryEffects) == 'table' then
-    origMastery = {}
-    for k, v in pairs(build.spec.masterySelections or {}) do
-      origMastery[k] = v
-    end
-    build.spec.masterySelections = build.spec.masterySelections or {}
+    local spec = build.spec
     for nodeId, effectId in pairs(params.masteryEffects) do
-      build.spec.masterySelections[tonumber(nodeId)] = effectId
+      local id, eid = tonumber(nodeId), tonumber(effectId)
+      local node = id and spec.nodes[id]
+      if not node or node.type ~= 'Mastery' then return nil, 'not a mastery node: ' .. tostring(nodeId) end
+      local effect = eid and spec.tree.masteryEffects and spec.tree.masteryEffects[eid]
+      if not effect then return nil, 'unknown mastery effect: ' .. tostring(effectId) end
+      -- A node replaced by a tattoo/runegraft keeps its override whatever the
+      -- selection (PassiveSpec:BuildAllDependsAndPaths), so nothing changes.
+      local overridden = spec.hashOverrides and spec.hashOverrides[id]
+      if not overridden and (not spec.allocNodes[id] or spec.masterySelections[id] ~= eid) then
+        local effectNode = { id = node.id, type = node.type, name = node.name, sd = {} }
+        for i, line in ipairs(effect.sd or {}) do effectNode.sd[i] = line end
+        spec.tree:ProcessStats(effectNode)
+        override.addNodes = override.addNodes or {}
+        override.addNodes[effectNode] = true
+        if spec.allocNodes[id] then
+          override.removeNodes = override.removeNodes or {}
+          override.removeNodes[spec.allocNodes[id]] = true
+        end
+      end
     end
   end
   local out = calcFunc(override, params and params.useFullDPS)
-  -- Restore original mastery selections
-  if origMastery then
-    build.spec.masterySelections = origMastery
-  end
   return out, baseOut
 end
 
@@ -1025,22 +1055,30 @@ function M.search_nodes(params)
   return { nodes = results, count = #results }
 end
 
--- Returns all allocated mastery nodes and the available effect options for each.
+-- Returns all allocated mastery nodes and the effects each could take: its own
+-- options minus those another mastery of the build already uses (PoB allows each
+-- effect once).
 -- Output: { masteries: [ { nodeId, nodeName, allocatedEffect, availableEffects: [{effectId, stat}] } ] }
 function M.get_mastery_options()
   if not build or not build.spec then
     return nil, 'build/spec not initialized'
   end
   local spec = build.spec
+  local takenBy = {}
+  for masteryId, effectId in pairs(spec.masterySelections or {}) do takenBy[effectId] = masteryId end
   local result = {}
   for nodeId, _ in pairs(spec.allocNodes or {}) do
     local node = spec.nodes[nodeId]
-    if node and node.isMastery and node.masteryEffects then
+    local overridden = spec.hashOverrides and spec.hashOverrides[nodeId]
+    if node and node.type == 'Mastery' and node.masteryEffects and not overridden then
       local allocated = spec.masterySelections and spec.masterySelections[nodeId]
       local available = {}
-      for effectId, effectData in pairs(node.masteryEffects) do
-        local stat = effectData.sd and table.concat(effectData.sd, ', ') or tostring(effectId)
-        table.insert(available, { effectId = effectId, stat = stat })
+      for _, option in ipairs(node.masteryEffects) do
+        local effect = spec.tree.masteryEffects and spec.tree.masteryEffects[option.effect]
+        local owner = takenBy[option.effect]
+        if effect and (owner == nil or owner == nodeId) then
+          table.insert(available, { effectId = option.effect, stat = table.concat(effect.sd or {}, ', ') })
+        end
       end
       table.insert(result, {
         nodeId = nodeId,
