@@ -18,7 +18,8 @@ import { handleStartWatching, handleStopWatching, handleGetRecentChanges, handle
 import { handleCompareTrees, handleGetNearbyNodes, handleFindPath, handleGetPassiveUpgrades, handleSuggestMasteries } from "../handlers/treeHandlers.js";
 import { handleGetBuildIssues, formatIssuesResponse } from "../handlers/buildGoalsHandlers.js";
 import { handleFindBestAnointment } from "../handlers/anointHandlers.js";
-import { handleLuaStart, handleLuaStop, handleLuaNewBuild, handleLuaSaveBuild, handleLuaLoadBuild, handleLuaGetStats, handleLuaGetBuildSnapshot, handleLuaGetTree, handleLuaSetTree, handleSearchTreeNodes, handleLuaGetBuildInfo, handleLuaReloadBuild, handleUpdateTreeDelta, handleCreateSpec, handleListSpecs, handleSelectSpec, handleDeleteSpec, handleRenameSpec, handleListItemSets, handleSelectItemSet } from "../handlers/luaHandlers.js";
+import { handleLuaStart, handleLuaStop, handleLuaNewBuild, handleLuaSaveBuild, handleLuaLoadBuild, handleLuaImportCode, handleLuaGetAilments,
+  handleLuaGetStats, handleLuaGetBuildSnapshot, handleLuaGetTree, handleLuaSetTree, handleSearchTreeNodes, handleLuaGetBuildInfo, handleLuaReloadBuild, handleUpdateTreeDelta, handleCreateSpec, handleListSpecs, handleSelectSpec, handleDeleteSpec, handleRenameSpec, handleListItemSets, handleSelectItemSet } from "../handlers/luaHandlers.js";
 import { handleAddItem, handleGetEquippedItems, handleToggleFlask, handleGetSkillSetup, handleSetMainSkill, handleCreateSocketGroup, handleAddGem, handleSetGemLevel, handleSetGemQuality, handleRemoveSkill, handleRemoveGem, handleSetupSkillWithGems, handleAddMultipleItems, handleSetSocketGroupEnabled, handleSetGemEnabled } from "../handlers/itemSkillHandlers.js";
 import { handleAnalyzeDefenses, handleSuggestOptimalNodes, handleOptimizeTree } from "../handlers/optimizationHandlers.js";
 import { handleAnalyzeItems, handleOptimizeSkillLinks, handleCreateBudgetBuild } from "../handlers/advancedOptimizationHandlers.js";
@@ -35,6 +36,7 @@ import { handleCheckBossReadiness } from "../handlers/bossReadinessHandlers.js";
 import { handleSuggestWatchersEye } from "../handlers/jewelAdvisorHandlers.js";
 import { handleSuggestCrafting } from "../handlers/craftingAdvisorHandler.js";
 import { handleFindItemUpgrades as handleFindItemUpgradesNew } from "../handlers/itemShoppingHandler.js";
+import { handleClassifyItemAffixes, handleListCraftableMods, handleFindAffixTiers } from "../handlers/affixHandlers.js";
 
 export interface ToolRouterDependencies {
   toolGate: ToolGate;
@@ -157,7 +159,7 @@ export async function routeToolCall(
 
     case "lua_save_build":
       if (!args) throw new Error("Missing arguments");
-      return await handleLuaSaveBuild(luaContext, args.build_name as string);
+      return await handleLuaSaveBuild(luaContext, args.build_name as string, args.overwrite === true);
 
     case "lua_load_build":
       if (!args) throw new Error("Missing arguments");
@@ -165,6 +167,14 @@ export async function routeToolCall(
         luaContext,
         args.build_name as string | undefined,
         args.build_xml as string | undefined,
+        args.name as string | undefined
+      );
+
+    case "lua_import_code":
+      if (!args) throw new Error("Missing arguments");
+      return await handleLuaImportCode(
+        luaContext,
+        args.code as string,
         args.name as string | undefined
       );
 
@@ -184,6 +194,9 @@ export async function routeToolCall(
         }],
       };
     }
+
+    case "lua_get_ailments":
+      return await handleLuaGetAilments(luaContext);
 
     case "lua_get_stats":
       return await handleLuaGetStats(luaContext, args?.category as string | undefined);
@@ -205,7 +218,8 @@ export async function routeToolCall(
       return await handleUpdateTreeDelta(
         luaContext,
         args.add_nodes as string[] | undefined,
-        args.remove_nodes as string[] | undefined
+        args.remove_nodes as string[] | undefined,
+        args.mastery_effects as Record<string, number> | undefined
       );
 
     case "create_spec":
@@ -723,7 +737,12 @@ export async function routeToolCall(
 
     case "plan_leveling":
       return await handlePlanLeveling(
-        { getLuaClient: deps.getLuaClient, ensureLuaClient: deps.ensureLuaClient },
+        {
+          getLuaClient: deps.getLuaClient,
+          ensureLuaClient: deps.ensureLuaClient,
+          readBuild: (name: string) =>
+            deps.contextBuilder.buildHandlerContext().buildService.readBuild(name),
+        },
         args || {}
       );
 
@@ -759,6 +778,27 @@ export async function routeToolCall(
       };
       return await handleSuggestCrafting(craftingContext, args as any);
     }
+
+    case "classify_item_affixes":
+      return await handleClassifyItemAffixes({ mod_lines: (args?.mod_lines as string[]) ?? [] });
+
+    case "list_craftable_mods":
+      return await handleListCraftableMods({
+        item_class: String(args?.item_class ?? ""),
+        item_level: Number(args?.item_level ?? 0),
+        affix_type: args?.affix_type === undefined ? undefined : String(args.affix_type),
+        search: args?.search === undefined ? undefined : String(args.search),
+      });
+
+    case "find_affix_tiers":
+      return await handleFindAffixTiers({
+        search: String(args?.search ?? ""),
+        affix_type: args?.affix_type === undefined ? undefined : String(args.affix_type),
+        slot_tags: (args?.slot_tags as string[]) ?? undefined,
+        max_item_level: args?.max_item_level === undefined ? undefined : Number(args.max_item_level),
+        include_unobtainable: Boolean(args?.include_unobtainable),
+        max_results: args?.max_results === undefined ? undefined : Number(args.max_results),
+      });
 
     default:
       throw new Error(`Unknown tool: ${name}`);

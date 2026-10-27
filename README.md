@@ -64,7 +64,7 @@ Works against a **stock [PathOfBuildingCommunity](https://github.com/PathOfBuild
 ### Build Export & Persistence
 - **Export**: Copy builds to XML files with optional notes
 - **Save Tree**: Write optimized passive tree back to an existing build file
-- **Snapshots**: Versioned build history with tags, stat metadata, and one-click rollback
+- **Snapshots**: Versioned build history with tags, stat metadata, and one-click rollback; restoring the active source also reloads the engine
 
 ### Currency & Market Data (poe.ninja)
 - **Exchange Rates**: Real-time currency prices in Chaos Orb equivalent
@@ -112,7 +112,11 @@ npm run build
 }
 ```
 
-#### Full Configuration (With Lua Bridge)
+#### With the Lua Bridge
+
+If PoB is installed (macOS), this is the whole configuration. `POB_PATH`, `POB_DIRECTORY`
+and `POB_CMD` are detected from the installed app.
+
 ```json
 {
   "mcpServers": {
@@ -120,24 +124,28 @@ npm run build
       "command": "node",
       "args": ["/absolute/path/to/pob-mcp-server/build/index.js"],
       "env": {
-        "POB_DIRECTORY": "/path/to/your/Path of Building/Builds",
-        "POB_LUA_ENABLED": "true",
-        "POB_PATH": "/path/to/PathOfBuilding/src",
-        "POB_CMD": "/usr/local/bin/luajit",
-        "POB_TIMEOUT_MS": "10000"
+        "POB_LUA_ENABLED": "true"
       }
     }
   }
 }
 ```
 
+Set `POB_PATH` explicitly only when driving a PathOfBuilding git checkout instead of an
+installed app, or when the app lives somewhere unusual:
+
+```json
+        "POB_PATH": "/path/to/PathOfBuilding/src",
+        "POB_CMD": "/opt/homebrew/bin/luajit"
+```
+
 ### Environment Variables
 
 | Variable | Default | Description |
 |---|---|---|
-| `POB_DIRECTORY` | OS-default Builds dir | Path to your PoB builds directory |
+| `POB_DIRECTORY` | detected Builds dir | Path to your PoB builds directory |
 | `POB_LUA_ENABLED` | `false` | Set `"true"` to enable Lua bridge |
-| `POB_PATH` | `~/Projects/PathOfBuilding/src` | Path to a stock PathOfBuilding checkout's `src/` directory (`POB_FORK_PATH` is accepted as a legacy alias) |
+| `POB_PATH` | installed PoB app, else `~/Projects/PathOfBuilding/src` | `src/` of a stock PathOfBuilding checkout. Usually unnecessary: an installed PoB is detected automatically (`POB_FORK_PATH` is a legacy alias) |
 | `POB_CMD` | `luajit` | LuaJIT binary path |
 | `POB_TIMEOUT_MS` | `10000` | Lua request timeout (ms) |
 | `POB_DEBUG` | `false` | Set `"true"` for verbose Lua bridge logging |
@@ -149,9 +157,42 @@ npm run build
 | `POE_CACHE_TTL` | `300` | Trade API response cache TTL in seconds |
 | `POE_RATE_LIMIT_PER_SECOND` | `4` | Trade API requests per second |
 
+### Saving and restoring builds
+
+`lua_save_build` writes atomically. Saving back to the file loaded into the bridge
+is allowed. To replace a different existing file, pass `overwrite: true` explicitly;
+otherwise choose a new name. Saved-file stats are invalidated immediately, and names
+with or without `.xml` share the same cache entry.
+
+`save_tree` preserves unrelated XML elements and writes mastery selections in PoB's
+native format. Snapshot restore reloads the engine when that exact source file is
+active. If the reload fails, the response states that the file was restored but
+live stats are not yet synchronized. Another active build is left untouched.
+
+Affix tools support both current `Data/ModExplicit.lua` and legacy `Data/ModItem.lua`
+installations. Unmatched or ambiguous explicit lines leave remaining slots unknown.
+
 ### Setting Up the Lua Bridge
 
 The Lua bridge uses PoB's actual calculation engine for accurate stats.
+
+#### If you already have Path of Building installed (macOS)
+
+Install LuaJIT and you are done:
+
+```bash
+brew install luajit
+```
+
+The server locates the engine inside the installed app, so there is no checkout to clone
+and no Lua modules to install. It uses the writable `src/` copy the app maintains under
+`~/Library/Application Support/PathOfBuildingMac`, which means the engine always matches
+the PoB you actually run, and the app's own C modules, which are the ones PoB ships no
+non-Windows build of in the repo.
+
+Skip to step 4 to verify.
+
+#### Working from a PathOfBuilding checkout instead
 
 #### 1. Install LuaJIT
 ```bash
@@ -164,7 +205,24 @@ sudo apt-get install luajit
 # Windows: download from https://luajit.org/ and add to PATH
 ```
 
-#### 2. Clone PathOfBuilding
+#### 2. Install PoB's Lua C modules (macOS and Linux)
+
+PoB commits its C modules to `runtime/` as Windows `.dll` builds only, so a checkout
+cannot supply them anywhere else. Without this the bridge appears to hang and then times
+out, because PoB reports `module 'lua-utf8' not found` and waits for a keypress that
+never comes.
+
+```bash
+luarocks --lua-version=5.1 --local install luautf8
+
+# Homebrew LuaJIT needs to be pointed at explicitly:
+luarocks --lua-version=5.1 --lua-dir=$(brew --prefix luajit) --local install luautf8
+```
+
+The bridge searches `~/.luarocks/lib/lua/5.1`, so `--local` is enough. Windows users can
+skip this: the bundled DLLs are used.
+
+#### 3. Clone PathOfBuilding
 ```bash
 git clone https://github.com/PathOfBuildingCommunity/PathOfBuilding.git
 ```
@@ -172,21 +230,33 @@ Note the full path to the `src/` directory — that's your `POB_PATH`.
 
 > No fork or patches are required. The server ships its own stdio adapter (`lua/vanilla_stdio_bridge.lua` + `lua/pob_ops.lua`) that loads the stock `HeadlessWrapper.lua` as a library and drives PoB's real calculation engine directly. Every Lua-bridge tool — stats, tree editing, gems, items, config, specs, save/export, anointments, weighted trade queries — works against an unmodified checkout. Call `lua_get_capabilities` at runtime for the authoritative action list.
 
-To verify a checkout locally after building this project:
+To verify locally after building this project:
 
 ```bash
-POB_PATH=/path/to/PathOfBuilding/src npm run test:smoke
+npm run test:smoke
 ```
+
+The smoke tests resolve the engine the same way the server does, so an installed
+PoB needs no configuration. Set `POB_PATH` only to point them at a checkout.
 
 This runs both the adapter contract and MCP stdio transport checks: tool discovery, capabilities, build load, snapshot, stats, items, skills, reversible tree mutation, config, anointment ranking, and build info.
 
 For the deep end-to-end workflow suite:
 
 ```bash
-POB_PATH=/path/to/PathOfBuilding/src npm run test:smoke:full
+npm run test:smoke:full
 ```
 
 This verifies blank-build gem editing, build discovery and file persistence, loading, character-level mutation and restoration, tree search, build validation, configuration/snapshot save-and-restore, and defensive/boss-readiness analysis.
+
+For persistence regression checks against the real engine:
+
+```bash
+npm run test:smoke:persistence
+```
+
+This checks overwrite protection, cache refresh, snapshot reload, XML notes and
+mastery preservation, and rejection of incomplete native imports.
 
 To exercise the live Trade API integration (requires network access):
 
@@ -199,7 +269,7 @@ This verifies MCP discovery plus live league, stat, item-search, price-check, re
 To also exercise the authenticated weighted BIS search (requires your `POESESSID`):
 
 ```bash
-POB_PATH=/path/to/PathOfBuilding/src POE_SESSION_ID=<your POESESSID> npm run test:smoke:weighted
+POE_SESSION_ID=<your POESESSID> npm run test:smoke:weighted
 ```
 
 To verify live crafting-data integration (requires network access):
@@ -221,13 +291,13 @@ Stock `HeadlessWrapper.lua` is meant for PoB's own unit tests, so the adapter wo
 - **Failed loads:** a load that fails, raises a prompt or opens a popup is an error, and every build-reading action refuses until the next successful load instead of answering with the previous build.
 - **Dev-mode autosave** to `~~temp~~.xml` on every build switch is disabled.
 
-#### 3. Verify
+#### 4. Verify
 ```bash
 luajit -v
 ls /path/to/PathOfBuilding/src/HeadlessWrapper.lua
 ```
 
-#### 4. Update Claude Desktop config and restart Claude Desktop
+#### 5. Update Claude Desktop config and restart Claude Desktop
 
 ---
 
@@ -270,11 +340,13 @@ With every optional integration enabled, the server registers **99 tools** acros
 | `lua_get_build_snapshot` | Compact current-state view: core stats, tree count, equipped items, and main gems |
 | `lua_new_build` | Create a blank build for a given class/ascendancy |
 | `lua_load_build` | Load a build file into the engine |
+| `lua_import_code` | Decode a PoB import/export code (e.g. from pobb.in or the desktop app's Generate button) and load it into the engine |
 | `lua_save_build` | Save the current in-memory build to a `.xml` file |
 | `lua_reload_build` | Reload the current build from disk |
 | `lua_get_build_info` | Get current build metadata (class, level, etc.) |
 | `set_character_level` | Set level and recalculate all stats |
 | `lua_get_stats` | Get calculated stats (`category`: `offense`/`defense`/`all`) |
+| `lua_get_ailments` | Non-damaging ailment magnitude, and whether the DPS calc is crediting it |
 | `lua_get_tree` | View passive tree: class, ascendancy, all allocated node IDs |
 | `lua_set_tree` | Replace passive tree allocation (preserves class if omitted) |
 | `update_tree_delta` | Add/remove individual nodes without replacing entire tree |
@@ -538,38 +610,20 @@ Issues and pull requests are welcome!
 
 <!-- readme: collaborators,contributors -start -->
 <table>
-	<tbody>
-		<tr>
-            <td align="center">
-                <a href="https://github.com/ianderse">
-                    <img src="https://avatars.githubusercontent.com/u/5242189?v=4" width="100;" alt="ianderse"/>
-                    <br />
-                    <sub><b>Ian</b></sub>
-                </a>
-            </td>
-            <td align="center">
-                <a href="https://github.com/J-Gierend">
-                    <img src="https://avatars.githubusercontent.com/u/39157646?v=4" width="100;" alt="J-Gierend"/>
-                    <br />
-                    <sub><b>J-Gierend</b></sub>
-                </a>
-            </td>
-            <td align="center">
-                <a href="https://github.com/gonzodamus">
-                    <img src="https://avatars.githubusercontent.com/u/219195895?v=4" width="100;" alt="gonzodamus"/>
-                    <br />
-                    <sub><b>gonzodamus</b></sub>
-                </a>
-            </td>
-            <td align="center">
-                <a href="https://github.com/mcagnion">
-                    <img src="https://avatars.githubusercontent.com/u/22574458?v=4" width="100;" alt="mcagnion"/>
-                    <br />
-                    <sub><b>Mickael Cagnion</b></sub>
-                </a>
-            </td>
-		</tr>
-	<tbody>
+  <tbody>
+    <tr>
+      <td align="center"><a href="https://github.com/ianderse"><img src="https://avatars.githubusercontent.com/u/5242189?v=4" width="100" alt="ianderse"/><br /><sub><b>Ian</b></sub></a></td>
+      <td align="center"><a href="https://github.com/rchasman"><img src="https://avatars.githubusercontent.com/u/1267219?v=4" width="100" alt="rchasman"/><br /><sub><b>Roey D. Chasman</b></sub></a></td>
+      <td align="center"><a href="https://github.com/notquitedrdeath"><img src="https://avatars.githubusercontent.com/u/890462?v=4" width="100" alt="notquitedrdeath"/><br /><sub><b>Tim Death</b></sub></a></td>
+      <td align="center"><a href="https://github.com/J-Gierend"><img src="https://avatars.githubusercontent.com/u/39157646?v=4" width="100" alt="J-Gierend"/><br /><sub><b>J-Gierend</b></sub></a></td>
+      <td align="center"><a href="https://github.com/gonzodamus"><img src="https://avatars.githubusercontent.com/u/219195895?v=4" width="100" alt="gonzodamus"/><br /><sub><b>gonzodamus</b></sub></a></td>
+      <td align="center"><a href="https://github.com/Kloggzer"><img src="https://avatars.githubusercontent.com/u/19823711?v=4" width="100" alt="Kloggzer"/><br /><sub><b>Marius K</b></sub></a></td>
+    </tr>
+    <tr>
+      <td align="center"><a href="https://github.com/mcagnion"><img src="https://avatars.githubusercontent.com/u/22574458?v=4" width="100" alt="mcagnion"/><br /><sub><b>Mickael Cagnion</b></sub></a></td>
+      <td align="center"><a href="https://github.com/exception0x876"><img src="https://avatars.githubusercontent.com/u/676813?v=4" width="100" alt="exception0x876"/><br /><sub><b>exception0x876</b></sub></a></td>
+    </tr>
+  </tbody>
 </table>
 <!-- readme: collaborators,contributors -end -->
 
