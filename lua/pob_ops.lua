@@ -107,7 +107,13 @@ function M.recalculate()
   build.outputRevision = (build.outputRevision or 0) + 1
   build.buildFlag = false
   if build.skillsTab and build.skillsTab.UpdateSocketGroups then build.skillsTab:UpdateSocketGroups() end
-  build.calcsTab:BuildOutput()
+  -- Let the bridge skip the CALCS pass during this recalculation. It is only
+  -- rebuilt when a tool actually needs it (get_ailments). Loads do not set the
+  -- flag, so the output right after a load keeps PoB's exact sequence.
+  _G.POB_MCP_DEFER_CALCS = true
+  local ok, err = pcall(build.calcsTab.BuildOutput, build.calcsTab)
+  _G.POB_MCP_DEFER_CALCS = false
+  if not ok then error(err, 0) end
   if build.RefreshStatList then build:RefreshStatList() end
   if build.configTab then
     -- OnFrame hands the config tab the new misc calculator; clearing it lets
@@ -215,7 +221,11 @@ function M.get_ailments()
   local configInput = build.configTab and build.configTab.input or {}
   local configIndex = getAilmentConfigIndex()
   -- BuildOutput populates two environments; the breakdown only exists in the
-  -- CALCS-mode one, and get_main_output hands back the MAIN-mode output.
+  -- CALCS-mode one, and get_main_output hands back the MAIN-mode output. The
+  -- bridge defers that pass for every other tool, so build it here if it is.
+  if build.calcsTab.calcsEnvPending and build.calcsTab.BuildCalcsEnv then
+    build.calcsTab:BuildCalcsEnv()
+  end
   local env = build.calcsTab.calcsEnv
   local breakdown = env and env.player and env.player.breakdown or nil
 

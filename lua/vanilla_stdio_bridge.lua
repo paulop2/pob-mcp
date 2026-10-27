@@ -262,30 +262,69 @@ do
   end
 end
 
--- CalcsTab:BuildOutput ends by building the misc calculator: one more full
--- calculation of the build plus its Full DPS roll-up (another full calculation
--- per Full DPS skill). Only calc_with, anoint scoring and GUI tooltips use it,
--- yet every load and every recalculation paid for it. It is now built on the
--- first GetMiscCalculator call instead. Nothing in between writes the
--- calculation cache it reads (only the next BuildOutput, which wipes it and
--- starts over), so it is the same calculator.
+-- CalcsTab:BuildOutput does work the MCP does not need on every recalculation:
+--
+-- 1. It ends by building the misc calculator: one more full calculation of the
+--    build plus its Full DPS roll-up (another full calculation per Full DPS
+--    skill). Only calc_with, anoint scoring and GUI tooltips use it, yet every
+--    load and every recalculation paid for it. It is now built on the first
+--    GetMiscCalculator call instead.
+-- 2. It runs a second calculation pass for the CALCS tab ("CALCS"), after the
+--    MAIN pass that fills mainOutput. The MCP reads the CALCS environment only
+--    for get_ailments (pob_ops.get_ailments); the GUI breakdown and compare
+--    tabs are the other consumers. It is now built on demand too.
+--
+-- Nothing in between writes the calculation cache either consumer reads (only
+-- the next BuildOutput, which wipes it and starts over), so both are the same
+-- values PoB would have produced eagerly.
 do
   local okCalcs, calcs = pcall(require, 'Modules.Calcs')
   local CalcsTab = common and common.classes and common.classes.CalcsTab
   if okCalcs and type(calcs) == 'table' and type(calcs.getMiscCalculator) == 'function'
+      and type(calcs.buildOutput) == 'function'
       and CalcsTab and CalcsTab.BuildOutput and CalcsTab.GetMiscCalculator then
     local getMisc, tabBuildOutput, tabGetMisc = calcs.getMiscCalculator, CalcsTab.BuildOutput, CalcsTab.GetMiscCalculator
+    local buildOutput = calcs.buildOutput
     local deferMisc = false
+    local deferCalcs = false
+    local deferredCalcs = false
+    -- The CALCS environment still has to be structurally usable while it is
+    -- deferred: CalcsTab:CheckFlag reads calcsEnv.player.mainSkill during
+    -- OnFrame. Reuse the last one; it is only read for display flags until a
+    -- tool asks for the CALCS pass again. Before the first pass of a freshly
+    -- loaded build there is nothing to reuse, so that one runs eagerly.
+    local previousCalcsEnv = nil
     calcs.getMiscCalculator = function(...)
       if deferMisc then return nil, nil end
       return getMisc(...)
     end
+    -- Only adapter recalcs (pob_ops.recalculate) opt in; loads keep PoB's
+    -- exact sequence, so output right after a load is bit-for-bit unchanged.
+    calcs.buildOutput = function(b, mode, ...)
+      if deferCalcs and mode == 'CALCS' and rawget(_G, 'POB_MCP_DEFER_CALCS') and previousCalcsEnv then
+        deferredCalcs = true
+        return previousCalcsEnv
+      end
+      return buildOutput(b, mode, ...)
+    end
     CalcsTab.BuildOutput = function(self, ...)
+      previousCalcsEnv = self.calcsEnv
+      deferredCalcs = false
       deferMisc = true
+      deferCalcs = true
       local ok, err = pcall(tabBuildOutput, self, ...)
       deferMisc = false
+      deferCalcs = false
       if not ok then error(err, 0) end
       self.miscCalculatorPending = (self.miscCalculator and self.miscCalculator[1] == nil) or nil
+      self.calcsEnvPending = deferredCalcs or nil
+    end
+    CalcsTab.BuildCalcsEnv = function(self)
+      self.calcsEnvPending = nil
+      local env = buildOutput(self.build, 'CALCS')
+      self.calcsEnv = env
+      self.calcsOutput = env and env.player and env.player.output or nil
+      return env
     end
     CalcsTab.GetMiscCalculator = function(self, ...)
       if self.miscCalculatorPending then
@@ -296,7 +335,7 @@ do
       return tabGetMisc(self, ...)
     end
   else
-    io.stderr:write('pob-mcp: Modules.Calcs/CalcsTab not as expected; the misc calculator is built eagerly\n')
+    io.stderr:write('pob-mcp: Modules.Calcs/CalcsTab not as expected; the misc calculator and CALCS environment are built eagerly\n')
   end
 end
 
