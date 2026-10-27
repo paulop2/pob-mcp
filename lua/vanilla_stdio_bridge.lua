@@ -552,8 +552,7 @@ local profileOut = PROFILE_FILE and PROFILE_FILE ~= '' and io.open(PROFILE_FILE,
 
 -- Actions that leave the loaded build exactly as a fresh load of its XML would:
 -- plain reads, anoint scoring (it restores the display item it borrows), and
--- calc_with without a mastery override (checked in the loop), whose simulation
--- runs on a separate calculator environment.
+-- calc_with, whose simulation runs on a separate calculator environment.
 -- save_build and export_build_xml are left out because they re-process socket
 -- groups / serialise through PoB's savers. Any other action forgets the XML.
 local PRISTINE_SAFE = {
@@ -561,7 +560,7 @@ local PRISTINE_SAFE = {
   get_output = true, get_stats = true, get_tree = true, get_items = true,
   get_skills = true, get_build_info = true, get_config = true,
   search_nodes = true, get_mastery_options = true, list_specs = true, list_item_sets = true,
-  evaluate_anoint_candidates = true,
+  evaluate_anoint_candidates = true, calc_with = true,
 }
 
 reply({ ok = true, ready = true, version = { adapter = 'vanilla-stdio-v2' } })
@@ -580,10 +579,7 @@ for line in io.lines() do
     reply({ ok = false, error = 'last build load failed: ' .. lastLoadError })
   else
     if not READ_ONLY[action] then BuildOps.invalidate() end
-    if action ~= 'load_build_xml' and not (PRISTINE_SAFE[action]
-        or (action == 'calc_with' and type(params) == 'table' and params.masteryEffects == nil)) then
-      pristine = nil
-    end
+    if action ~= 'load_build_xml' and not PRISTINE_SAFE[action] then pristine = nil end
     local ok, res = pcall(handler, params)
     local t1 = profileOut and os.clock()
     if not ok then
