@@ -1,4 +1,9 @@
 import { describe, it, expect, beforeEach } from '@jest/globals';
+import path from 'path';
+
+// resolveBuildFile resolves against path.sep, so build the expectations the
+// same way instead of hardcoding POSIX paths.
+const buildPath = (name: string) => path.resolve('/builds', name);
 
 const readFile = jest.fn(async (..._args: unknown[]) => '<?xml version="1.0"?><PathOfBuilding/>');
 jest.mock('fs/promises', () => ({ __esModule: true, default: { readFile } }));
@@ -23,7 +28,7 @@ describe('handleLuaReloadBuild', () => {
     await handleLuaReloadBuild(context, 'Luminary');
 
     expect(readFile).toHaveBeenCalledTimes(1);
-    expect(String(readFile.mock.calls[0][0])).toBe('/builds/Luminary.xml');
+    expect(String(readFile.mock.calls[0][0])).toBe(buildPath('Luminary.xml'));
   });
 
   // The suffix check has to be case-insensitive, matching buildFileName and the
@@ -32,12 +37,12 @@ describe('handleLuaReloadBuild', () => {
   it('treats an uppercase suffix as already present', async () => {
     await handleLuaReloadBuild(context, 'Luminary.XML');
 
-    expect(String(readFile.mock.calls[0][0])).toBe('/builds/Luminary.XML');
+    expect(String(readFile.mock.calls[0][0])).toBe(buildPath('Luminary.XML'));
   });
 
   it('strips the suffix for the name handed to the bridge', async () => {
     await handleLuaReloadBuild(context, 'Luminary.XML');
 
-    expect(loadBuildXml).toHaveBeenCalledWith(expect.any(String), 'Luminary', '/builds/Luminary.XML');
+    expect(loadBuildXml).toHaveBeenCalledWith(expect.any(String), 'Luminary', buildPath('Luminary.XML'));
   });
 });

@@ -45,7 +45,7 @@ describe('handleLuaGetAilments', () => {
   it('reports the threshold at which the ailment caps', async () => {
     const text = textOf(await handleLuaGetAilments(contextReturning([shock()])));
 
-    expect(text).toContain('Reaches the 50% maximum against an ailment threshold of 39,743 or less');
+    expect(text).toContain(`Reaches the 50% maximum against an ailment threshold of ${(39743).toLocaleString()} or less`);
   });
 
   it('stays quiet once the magnitude is configured', async () => {
