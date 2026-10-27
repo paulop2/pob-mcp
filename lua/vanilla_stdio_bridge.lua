@@ -89,24 +89,57 @@ if __mainObject__ and __mainObject__.main then
   __mainObject__.main.disableDevAutoSave = true
 end
 
--- SkillsTab:ProcessSocketGroup clears `grantedEffect.levels[level].cost` for
--- triggered skills by writing into the shared data.skills tables, so one build
--- zeroes the mana cost of that skill level for every build loaded after it in
--- this process. Remember the original cost tables and put them back before
--- each load.
-local skillCostSnapshot = {}
+-- PoB writes into the shared data.skills tables while it loads and calculates
+-- a build, so every later build in this process inherited those writes:
+--  * Classes/SkillsTab.lua:1188-1191 sets `levels[level].cost = {}` for
+--    triggered skills, zeroing that level's cost for everyone after.
+--  * Modules/CalcSetup.lua:1636-1637 flags supports granted by an item with
+--    `grantedEffect.fromItem = true`; CalcTools.lua:95 then stops the same
+--    support gem from supporting ordinary skills in later builds.
+--  * Modules/Data.lua:1033-1041 fills `statMap` lazily, and processMod may set
+--    `grantedEffect.hasGlobalEffect` on the way (read by CalcSetup.lua:1755).
+-- Each grantedEffect, its statMap and its level tables are snapshotted one
+-- level deep here and put back before each load, so every load starts from
+-- the data a fresh process has.
+local sharedSnapshot, sharedCounts = {}, {}
+local function snapshotTable(t)
+  local copy, n = {}, 0
+  for k, v in pairs(t) do
+    copy[k] = v
+    n = n + 1
+  end
+  sharedSnapshot[t], sharedCounts[t] = copy, n
+end
 if data and data.skills then
   for _, grantedEffect in pairs(data.skills) do
-    if type(grantedEffect) == 'table' and type(grantedEffect.levels) == 'table' then
-      for _, levelData in pairs(grantedEffect.levels) do
-        if type(levelData) == 'table' then skillCostSnapshot[levelData] = levelData.cost or false end
+    if type(grantedEffect) == 'table' then
+      snapshotTable(grantedEffect)
+      if type(grantedEffect.statMap) == 'table' then snapshotTable(grantedEffect.statMap) end
+      if type(grantedEffect.levels) == 'table' then
+        for _, levelData in pairs(grantedEffect.levels) do
+          if type(levelData) == 'table' then snapshotTable(levelData) end
+        end
       end
     end
   end
 end
-local function restoreSkillCosts()
-  for levelData, cost in pairs(skillCostSnapshot) do
-    levelData.cost = cost or nil
+local function restoreSharedData()
+  for t, copy in pairs(sharedSnapshot) do
+    -- rawget/rawset: statMap's __index would otherwise create the entry
+    local n, dirty = 0, false
+    for k, v in pairs(t) do
+      n = n + 1
+      if copy[k] ~= v then
+        rawset(t, k, copy[k])
+        dirty = true
+      end
+    end
+    -- Keys PoB removed only show up as a missing count or next to a change
+    if dirty or n ~= sharedCounts[t] then
+      for k, v in pairs(copy) do
+        if rawget(t, k) ~= v then rawset(t, k, v) end
+      end
+    end
   end
 end
 
@@ -138,7 +171,7 @@ local function loadFresh(xml, name)
   -- Loading straight over another build can read the outgoing build's tabs
   -- (e.g. a stale activeSpec index); passing through an empty build resets them.
   _G.newBuild()
-  restoreSkillCosts()
+  restoreSharedData()
   local stale = build and build.calcsTab and build.calcsTab.mainOutput
   _G.loadBuildFromXML(xml, name)
   local prompt = __mainObject__.promptMsg
@@ -322,7 +355,7 @@ handlers.new_build = function(params)
   if not _G.newBuild then return { ok = false, error = 'headless wrapper not initialized' } end
   if build and build.spec then build.spec.subGraphs = {} end
   _G.newBuild()
-  restoreSkillCosts()
+  restoreSharedData()
   lastLoadError = nil
   if params and (params.className or params.ascendancy) then
     local classId = params.className and (CLASS_IDS[params.className] or CLASS_IDS[params.className:lower()]) or 0
