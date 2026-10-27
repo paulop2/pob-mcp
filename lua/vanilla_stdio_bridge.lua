@@ -143,6 +143,73 @@ local function restoreSharedData()
   end
 end
 
+-- While TreeTab:Load reads a build's specs, PoB rebuilds every spec's node
+-- paths (PassiveSpec:BuildAllDependsAndPaths, a walk over the whole tree) once
+-- in the constructor and three more times inside ImportFromNodeList (SelectClass,
+-- SelectAscendClass, SelectSecondaryAscendClass) before the rebuild that counts,
+-- at its end. Nothing reads paths in between, so during TreeTab:Load the
+-- rebuilds are only recorded and run once per spec, before the first thing
+-- that reads the result: Load's closing ResetUndo, SetActiveSpec, or the end
+-- of TreeTab:Load.
+do
+  local classes = common and common.classes
+  local Spec, TreeTab = classes and classes.PassiveSpec, classes and classes.TreeTab
+  if Spec and TreeTab and Spec.BuildAllDependsAndPaths and Spec.ImportFromNodeList
+      and Spec.ResetUndo and TreeTab.Load and TreeTab.SetActiveSpec then
+    local rebuild = Spec.BuildAllDependsAndPaths
+    local deferring = false
+    local pending = setmetatable({}, { __mode = 'k' })
+    local function flush(spec)
+      if pending[spec] then
+        pending[spec] = nil
+        rebuild(spec)
+      end
+    end
+    local function flushAll(treeTab)
+      for _, spec in ipairs(treeTab.specList or {}) do flush(spec) end
+    end
+    -- Run fn with deferral switched to `on`, restoring the previous state even
+    -- when fn raises.
+    local function withDeferral(on, fn, ...)
+      local previous = deferring
+      deferring = on
+      local result = { pcall(fn, ...) }
+      deferring = previous
+      if not result[1] then error(result[2], 0) end
+      return unpack(result, 2, table.maxn(result))
+    end
+    Spec.BuildAllDependsAndPaths = function(self, ...)
+      if deferring then
+        pending[self] = true
+        return
+      end
+      return rebuild(self, ...)
+    end
+    -- PassiveSpec:Load ends with ResetUndo, which snapshots the allocation the
+    -- last rebuild settled. (ImportFromNodeList itself is not wrapped: pob_ops
+    -- tells its signature apart by the parameter count.)
+    local resetUndo = Spec.ResetUndo
+    Spec.ResetUndo = function(self, ...)
+      flush(self)
+      return resetUndo(self, ...)
+    end
+    local treeLoad, setActiveSpec = TreeTab.Load, TreeTab.SetActiveSpec
+    TreeTab.Load = function(self, ...)
+      local result = { withDeferral(true, treeLoad, self, ...) }
+      flushAll(self)
+      for spec in pairs(pending) do flush(spec) end
+      return unpack(result, 1, table.maxn(result))
+    end
+    TreeTab.SetActiveSpec = function(self, ...)
+      if not deferring then return setActiveSpec(self, ...) end
+      flushAll(self)
+      return withDeferral(false, setActiveSpec, self, ...)
+    end
+  else
+    io.stderr:write('pob-mcp: PassiveSpec/TreeTab not as expected; spec path rebuilds are not deferred\n')
+  end
+end
+
 local BuildOps = dofile(ADAPTER_DIR .. 'pob_ops.lua')
 
 -- Set when the last load_build_xml failed: the bridge then refuses to report
