@@ -33,7 +33,9 @@ async function call(name, args = {}, expectError = false) {
 }
 const life = text => Number(text.match(/^Life: ([\d.]+)/m)?.[1]);
 const engine = new PoBLuaApiClient({ cwd, cmd: process.env.POB_CMD,
-  args: [resolve('lua/vanilla_stdio_bridge.lua')], env: { POB_API_STDIO: '0' }, timeoutMs: 60000 });
+  args: process.env.POB_ARGS
+    ? process.env.POB_ARGS.split(/\s+/).filter(Boolean)
+    : [resolve('lua/vanilla_stdio_bridge.lua')], env: { POB_API_STDIO: '0' }, timeoutMs: 60000 });
 try {
   await client.connect(transport);
   await call('analyze_build', { build_name: 'lean' });

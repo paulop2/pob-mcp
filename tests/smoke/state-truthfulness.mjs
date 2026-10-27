@@ -11,7 +11,9 @@ const cwd = smokePoBSrc();
 const client = new PoBLuaApiClient({
   cwd,
   cmd: process.env.POB_CMD,
-  args: [resolve('lua/vanilla_stdio_bridge.lua')],
+  args: process.env.POB_ARGS
+    ? process.env.POB_ARGS.split(/\s+/).filter(Boolean)
+    : [resolve('lua/vanilla_stdio_bridge.lua')],
   env: { POB_API_STDIO: '0' },
   timeoutMs: 60_000,
 });
