@@ -1,7 +1,10 @@
-import { describe, it, expect, jest, beforeEach } from '@jest/globals';
+import { describe, it, expect, jest, beforeEach, afterEach } from '@jest/globals';
 import { TreeService } from '../src/services/treeService';
 import { BuildService } from '../src/services/buildService';
 import type { PassiveTreeNode, PassiveTreeData, PoBBuild } from '../src/types';
+import { mkdtemp, mkdir, rm, writeFile } from 'fs/promises';
+import { tmpdir } from 'os';
+import { join } from 'path';
 
 // Mock BuildService
 jest.mock('../src/services/buildService');
@@ -403,6 +406,39 @@ describe('TreeService', () => {
 
       // A zero-cost path makes the already-allocated state explicit to callers.
       expect(result).toEqual([{ nodes: [], cost: 0 }]);
+    });
+  });
+
+  describe('getTreeData', () => {
+    const savedPobPath = process.env.POB_PATH;
+    let pobSrc: string;
+
+    beforeEach(async () => {
+      pobSrc = await mkdtemp(join(tmpdir(), 'pob-tree-'));
+      await mkdir(join(pobSrc, 'TreeData', '9_99'), { recursive: true });
+      await writeFile(join(pobSrc, 'TreeData', '9_99', 'tree.lua'),
+        'return { ["nodes"]= { [101]= { ["name"]= "Local Notable", ["isNotable"]= true, ["out"]= { "102" } } } }');
+      process.env.POB_PATH = pobSrc;
+    });
+
+    afterEach(async () => {
+      if (savedPobPath === undefined) delete process.env.POB_PATH; else process.env.POB_PATH = savedPobPath;
+      await rm(pobSrc, { recursive: true, force: true });
+    });
+
+    it('reads tree data from the local PoB checkout without touching the network', async () => {
+      const fetchSpy = jest.spyOn(treeService, 'fetchTreeDataFromRepo');
+      const data = await treeService.getTreeData('9_99');
+      expect(fetchSpy).not.toHaveBeenCalled();
+      expect(data.nodes.get('101')?.name).toBe('Local Notable');
+    });
+
+    it('falls back to the network for versions the checkout does not have, and rejects unsafe version strings', async () => {
+      const remote: PassiveTreeData = { nodes: new Map(), version: 'remote' };
+      const fetchSpy = jest.spyOn(treeService, 'fetchTreeDataFromRepo').mockResolvedValue(remote);
+      expect(await treeService.getTreeData('9_98')).toBe(remote);
+      expect(await treeService.readLocalTreeData('../9_99')).toBeNull();
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
     });
   });
 });

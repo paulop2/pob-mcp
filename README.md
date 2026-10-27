@@ -142,6 +142,7 @@ npm run build
 | `POB_TIMEOUT_MS` | `10000` | Lua request timeout (ms) |
 | `POB_DEBUG` | `false` | Set `"true"` for verbose Lua bridge logging |
 | `POB_ARGS` | (none) | Space-separated arguments passed to the Lua process (overrides the default adapter arguments) |
+| `POB_LUA_PREWARM` | `true` | Start the Lua bridge (a few seconds of PoB boot) when the server starts instead of on the first Lua tool call; `"false"` disables |
 | `POE_TRADE_ENABLED` | `false` | Enable Trade API tools |
 | `POE_SESSION_ID` | (none) | Your POESESSID cookie value; required for the `find_weighted_trade_items` tool |
 | `POE_CACHE_TTL` | `300` | Trade API response cache TTL in seconds |

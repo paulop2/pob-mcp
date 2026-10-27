@@ -1,4 +1,6 @@
 import https from "https";
+import { readFile } from "fs/promises";
+import path from "path";
 import type {
   PassiveTreeNode,
   PassiveTreeData,
@@ -29,7 +31,7 @@ export class TreeService {
 
     // Cache miss - fetch from source
     console.error(`[Tree Cache] Miss for version ${version}`);
-    const treeData = await this.fetchTreeDataFromRepo(version);
+    const treeData = (await this.readLocalTreeData(version)) ?? await this.fetchTreeDataFromRepo(version);
 
     // Store in cache
     this.treeDataCache.set(version, {
@@ -48,6 +50,30 @@ export class TreeService {
       this.treeDataCache.clear();
       console.error(`[Tree Cache] Cleared all cached tree data`);
     }
+  }
+
+  /**
+   * Tree data from the local PoB checkout the Lua bridge calculates with
+   * (POB_PATH/TreeData/<version>/tree.lua): no network round-trip, and the
+   * same tree version as the calculation engine. Null when unavailable.
+   */
+  async readLocalTreeData(version: string): Promise<PassiveTreeData | null> {
+    const pobSrc = process.env.POB_PATH || process.env.POB_FORK_PATH;
+    if (!pobSrc || !/^[A-Za-z0-9_]+$/.test(version)) return null;
+    let content: string;
+    try {
+      content = await readFile(path.join(pobSrc, "TreeData", version, "tree.lua"), "utf-8");
+    } catch {
+      return null;
+    }
+    let treeData: PassiveTreeData;
+    try {
+      treeData = this.parseTreeLua(content, version);
+    } catch {
+      return null;
+    }
+    console.error(`[Tree Data] Loaded ${treeData.nodes.size} nodes for ${version} from the local PoB checkout`);
+    return treeData;
   }
 
   async fetchTreeDataFromRepo(version: string = "3_26"): Promise<PassiveTreeData> {
