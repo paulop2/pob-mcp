@@ -224,13 +224,15 @@ local function evaluate_anoint_candidates(params)
     tab.anointEnchantSlot = 1
     local calc = build.calcsTab:GetMiscCalculator()
     local repSlotName = item.base and item.base.type or slotName
-    local base = calc({ repSlotName = repSlotName, repItem = tab:anointItem(nil) })
+    -- Scores read CombinedDPS/TotalDPS/TotalEHP only, so the Full DPS roll-up
+    -- (another full calculation per Full DPS skill) is skipped.
+    local base = calc({ repSlotName = repSlotName, repItem = tab:anointItem(nil) }, false)
     local baseDps = tonumber(base.CombinedDPS or base.TotalDPS or 0) or 0
     local baseEhp = tonumber(base.TotalEHP or 0) or 0
     local candidates, evaluated, skipped = {}, 0, 0
     for id, node in pairs(build.spec.tree.nodes or {}) do
       if node.recipe and node.dn and node.modKey ~= '' and not build.spec.allocNodes[id] then
-        local candidateOk, output = pcall(calc, { repSlotName = repSlotName, repItem = tab:anointItem(node) })
+        local candidateOk, output = pcall(calc, { repSlotName = repSlotName, repItem = tab:anointItem(node) }, false)
         if candidateOk and output then
           local dps = (tonumber(output.CombinedDPS or output.TotalDPS or 0) or 0) - baseDps
           local ehp = (tonumber(output.TotalEHP or 0) or 0) - baseEhp
@@ -332,10 +334,24 @@ handlers.new_build = function(params)
   return { ok = true }
 end
 
+-- The XML the build in memory was loaded from, kept only while no action has
+-- changed that build since (see PRISTINE_SAFE below). Loading the same XML
+-- again then has nothing to do: a fresh load would rebuild the same state.
+local pristine = nil -- { xml = string, converted = true|nil }
+
 handlers.load_build_xml = function(params)
   if not params or type(params.xml) ~= 'string' then return { ok = false, error = 'missing xml' } end
   if not _G.loadBuildFromXML then return { ok = false, error = 'headless wrapper not initialized' } end
-  local ok, res = pcall(loadFresh, params.xml, (params.name and tostring(params.name)) or 'API Build')
+  local name = (params.name and tostring(params.name)) or 'API Build'
+  -- PoB renames a build loaded as "~~temp~~"; only plain names are reused.
+  if pristine and pristine.xml == params.xml and not lastLoadError and build and name ~= '~~temp~~' then
+    build.buildName = name
+    -- Still the state the load calculated (the dispatcher invalidated it anyway).
+    BuildOps.dirty = false
+    return { ok = true, build_id = 1, converted = pristine.converted, reused = true }
+  end
+  pristine = nil
+  local ok, res = pcall(loadFresh, params.xml, name)
   if not ok then
     lastLoadError = tostring(res)
     return { ok = false, error = lastLoadError }
@@ -343,7 +359,8 @@ handlers.load_build_xml = function(params)
   lastLoadError = nil
   -- The load just calculated the build; the next read needs no recalculation.
   BuildOps.dirty = false
-  return { ok = true, build_id = 1, converted = res == true or nil }
+  pristine = { xml = params.xml, converted = res == true or nil }
+  return { ok = true, build_id = 1, converted = pristine.converted }
 end
 
 -- Flatten nested output tables into dotted keys. Only plain data is followed:
@@ -456,7 +473,18 @@ handlers.get_items = op(BuildOps.get_items, 'items')
 handlers.get_skills = op(BuildOps.get_skills, 'skills')
 handlers.get_build_info = op(BuildOps.get_build_info, 'info')
 handlers.get_config = op(BuildOps.get_config, 'config')
+-- Output keys only the Full DPS roll-up writes. That roll-up re-runs the whole
+-- calculation once per Full DPS skill, so it is skipped when none is asked for.
+local FULL_DPS_FIELDS = { FullDPS = true, FullDotDPS = true, SkillDPS = true }
+
 handlers.calc_with = function(params)
+  if type(params) == 'table' and type(params.fields) == 'table' and params.useFullDPS == nil then
+    local wantsFullDPS = false
+    for _, name in ipairs(params.fields) do
+      if FULL_DPS_FIELDS[name] then wantsFullDPS = true end
+    end
+    if not wantsFullDPS then params.useFullDPS = false end
+  end
   local out, err = BuildOps.calc_with(params or {})
   if out == nil then return { ok = false, error = err or 'operation failed' } end
   -- `fields` limits the reply to the named top-level stats: a whole output is
@@ -518,8 +546,27 @@ local READ_ONLY = {
   save_build = true, list_specs = true, list_item_sets = true,
 }
 
+-- Opt-in per-action timing (handler vs encode), one line per request.
+local PROFILE_FILE = os.getenv('POB_PROFILE_LUA_LOG')
+local profileOut = PROFILE_FILE and PROFILE_FILE ~= '' and io.open(PROFILE_FILE, 'a') or nil
+
+-- Actions that leave the loaded build exactly as a fresh load of its XML would:
+-- plain reads, anoint scoring (it restores the display item it borrows), and
+-- calc_with without a mastery override (checked in the loop), whose simulation
+-- runs on a separate calculator environment.
+-- save_build and export_build_xml are left out because they re-process socket
+-- groups / serialise through PoB's savers. Any other action forgets the XML.
+local PRISTINE_SAFE = {
+  ping = true, version = true, get_capabilities = true, diagnostics = true,
+  get_output = true, get_stats = true, get_tree = true, get_items = true,
+  get_skills = true, get_build_info = true, get_config = true,
+  search_nodes = true, get_mastery_options = true, list_specs = true, list_item_sets = true,
+  evaluate_anoint_candidates = true,
+}
+
 reply({ ok = true, ready = true, version = { adapter = 'vanilla-stdio-v2' } })
 for line in io.lines() do
+  local t0 = profileOut and os.clock()
   local request = json.decode(line)
   local action, params = request and request.action, request and request.params or {}
   if action == 'quit' then
@@ -533,7 +580,12 @@ for line in io.lines() do
     reply({ ok = false, error = 'last build load failed: ' .. lastLoadError })
   else
     if not READ_ONLY[action] then BuildOps.invalidate() end
+    if action ~= 'load_build_xml' and not (PRISTINE_SAFE[action]
+        or (action == 'calc_with' and type(params) == 'table' and params.masteryEffects == nil)) then
+      pristine = nil
+    end
     local ok, res = pcall(handler, params)
+    local t1 = profileOut and os.clock()
     if not ok then
       reply({ ok = false, error = tostring(res) })
     elseif type(res) ~= 'table' then
@@ -543,6 +595,10 @@ for line in io.lines() do
       io.flush()
     else
       reply(res)
+    end
+    if profileOut then
+      profileOut:write(('{"action":"%s","handler_ms":%.2f,"encode_ms":%.2f}\n'):format(tostring(action), (t1 - t0) * 1000, (os.clock() - t1) * 1000))
+      profileOut:flush()
     end
   end
 end

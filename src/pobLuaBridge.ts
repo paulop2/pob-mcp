@@ -2,6 +2,10 @@ import { spawn, ChildProcessWithoutNullStreams } from "child_process";
 import { EventEmitter } from "events";
 import path from "path";
 import os from "os";
+import { appendFileSync } from "fs";
+
+// Opt-in latency log: one JSON line per bridge round-trip.
+const PROFILE_LOG = process.env.POB_PROFILE_LOG;
 
 /** Lua bridge request envelope */
 type LuaRequest = { action: string; params?: Record<string, unknown> };
@@ -244,8 +248,10 @@ export class PoBLuaApiClient {
     if (this.isSending) throw new Error("Concurrent request not supported");
 
     this.isSending = true;
+    const started = PROFILE_LOG ? performance.now() : 0;
     try {
-      this.proc.stdin.write(JSON.stringify(obj) + "\n");
+      const payload = JSON.stringify(obj);
+      this.proc.stdin.write(payload + "\n");
 
       // Read lines until we get valid JSON response
       // Skip non-JSON lines (like "LOADING", warnings, etc.)
@@ -278,6 +284,11 @@ export class PoBLuaApiClient {
         // Try to parse as JSON
         try {
           const res = JSON.parse(line);
+          if (PROFILE_LOG) {
+            try {
+              appendFileSync(PROFILE_LOG, JSON.stringify({ action: obj.action, ms: +(performance.now() - started).toFixed(2), req: payload.length, res: line.length }) + "\n");
+            } catch {}
+          }
           return res;
         } catch (e) {
           // Not valid JSON, keep looking
