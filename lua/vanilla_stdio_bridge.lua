@@ -210,6 +210,58 @@ do
   end
 end
 
+-- Which tinctures apply must not depend on table addresses. mergeTinctures
+-- (Modules/CalcPerform.lua:1905) walks `env.tinctures` with pairs() and stops
+-- after `TinctureLimit` items. The set is keyed by item objects, so with more
+-- active tinctures than the limit the one that applies follows pointer hash
+-- order, which changes between processes and with allocation history (e.g. a
+-- Pathfinder with two tinctures and limit 1: CritChance 35 or 97.4). Before
+-- each perform, keep only the first `limit` tinctures in slot order (Flask 1..5,
+-- the order initEnv inserts them in; a misc-calculator repItem takes the slot
+-- it replaces). The rest would have been skipped anyway, so with at most
+-- `limit` active nothing changes. Same rule as pob-oracle's reference.
+do
+  local function tinctureSlotOrder(env)
+    local order, seen = {}, {}
+    local itemsTab = env.build and env.build.itemsTab
+    local override = env.override or {}
+    if itemsTab and itemsTab.orderedSlots then
+      for _, slot in ipairs(itemsTab.orderedSlots) do
+        local item = itemsTab.items[slot.selItemId]
+        if override.repSlotName == slot.slotName and override.repItem then item = override.repItem end
+        if item and env.tinctures[item] and not seen[item] then
+          order[#order + 1], seen[item] = item, true
+        end
+      end
+    end
+    -- Not found in a slot (e.g. a toggleTincture override): stable by text.
+    local rest = {}
+    for item in pairs(env.tinctures) do
+      if not seen[item] then rest[#rest + 1] = item end
+    end
+    table.sort(rest, function(a, b)
+      return tostring(a.raw or a.name or '') < tostring(b.raw or b.name or '')
+    end)
+    for _, item in ipairs(rest) do order[#order + 1] = item end
+    return order
+  end
+
+  local okCalcs, calcs = pcall(require, 'Modules.Calcs')
+  if okCalcs and type(calcs) == 'table' and type(calcs.perform) == 'function' then
+    local perform = calcs.perform
+    calcs.perform = function(env, ...)
+      if type(env) == 'table' and type(env.tinctures) == 'table' and next(env.tinctures) and env.modDB then
+        local limit = math.max(env.modDB:Sum('BASE', nil, 'TinctureLimit'), 0)
+        local order = tinctureSlotOrder(env)
+        for i = limit + 1, #order do env.tinctures[order[i]] = nil end
+      end
+      return perform(env, ...)
+    end
+  else
+    io.stderr:write('pob-mcp: Modules.Calcs not found; tincture order is left to PoB\n')
+  end
+end
+
 local BuildOps = dofile(ADAPTER_DIR .. 'pob_ops.lua')
 
 -- Set when the last load_build_xml failed: the bridge then refuses to report
