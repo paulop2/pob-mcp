@@ -110,7 +110,10 @@ function M.recalculate()
   build.calcsTab:BuildOutput()
   if build.RefreshStatList then build:RefreshStatList() end
   if build.configTab then
-    build.configTab.calcFunc, build.configTab.calcBase = build.calcsTab:GetMiscCalculator()
+    -- OnFrame hands the config tab the new misc calculator; clearing it lets
+    -- the tab fetch it when it needs one (ConfigTab.lua:756) instead of
+    -- building the calculator on every recalculation.
+    build.configTab.calcFunc, build.configTab.calcBase = nil, nil
   end
 end
 

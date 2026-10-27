@@ -262,6 +262,44 @@ do
   end
 end
 
+-- CalcsTab:BuildOutput ends by building the misc calculator: one more full
+-- calculation of the build plus its Full DPS roll-up (another full calculation
+-- per Full DPS skill). Only calc_with, anoint scoring and GUI tooltips use it,
+-- yet every load and every recalculation paid for it. It is now built on the
+-- first GetMiscCalculator call instead. Nothing in between writes the
+-- calculation cache it reads (only the next BuildOutput, which wipes it and
+-- starts over), so it is the same calculator.
+do
+  local okCalcs, calcs = pcall(require, 'Modules.Calcs')
+  local CalcsTab = common and common.classes and common.classes.CalcsTab
+  if okCalcs and type(calcs) == 'table' and type(calcs.getMiscCalculator) == 'function'
+      and CalcsTab and CalcsTab.BuildOutput and CalcsTab.GetMiscCalculator then
+    local getMisc, tabBuildOutput, tabGetMisc = calcs.getMiscCalculator, CalcsTab.BuildOutput, CalcsTab.GetMiscCalculator
+    local deferMisc = false
+    calcs.getMiscCalculator = function(...)
+      if deferMisc then return nil, nil end
+      return getMisc(...)
+    end
+    CalcsTab.BuildOutput = function(self, ...)
+      deferMisc = true
+      local ok, err = pcall(tabBuildOutput, self, ...)
+      deferMisc = false
+      if not ok then error(err, 0) end
+      self.miscCalculatorPending = (self.miscCalculator and self.miscCalculator[1] == nil) or nil
+    end
+    CalcsTab.GetMiscCalculator = function(self, ...)
+      if self.miscCalculatorPending then
+        self.miscCalculatorPending = nil
+        local fn, base = getMisc(self.build)
+        self.miscCalculator = { fn, base }
+      end
+      return tabGetMisc(self, ...)
+    end
+  else
+    io.stderr:write('pob-mcp: Modules.Calcs/CalcsTab not as expected; the misc calculator is built eagerly\n')
+  end
+end
+
 local BuildOps = dofile(ADAPTER_DIR .. 'pob_ops.lua')
 
 -- Set when the last load_build_xml failed: the bridge then refuses to report
